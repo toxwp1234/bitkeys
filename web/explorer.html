@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cuvre · keyspace explorer</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='%23f7931a'/></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    .xwrap { max-width: 1000px; }
+    .bar { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 14px; }
+    .field { display: flex; flex-direction: column; gap: 5px; }
+    .field label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+    .field input, .field select { background: var(--panel); border: 1px solid var(--border); color: var(--text);
+      font-family: var(--mono); font-size: 13px; padding: 8px 10px; border-radius: 8px; outline: none; }
+    .field input[type=number] { width: 80px; }
+    .stage { display: grid; grid-template-columns: 1fr 300px; gap: 16px; align-items: start; }
+    #canvas { width: 100%; height: 520px; background: #0a0c10; border: 1px solid var(--border);
+      border-radius: 12px; display: block; cursor: crosshair; touch-action: none; }
+    .side { display: flex; flex-direction: column; gap: 14px; }
+    .kv { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+    .kv .k { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; }
+    .kv .v { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .metric { background: var(--panel); border-radius: 10px; padding: 10px 12px; }
+    .metric .k { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+    .metric .v { font-family: var(--mono); font-size: 18px; font-weight: 500; margin-top: 3px; }
+    .metric .v.hit { color: var(--green); }
+    .samples-box .row { font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 3px 0; word-break: break-all; }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.6; }
+    .note { background: var(--panel); border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0;
+      padding: 10px 12px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+    a.back { color: var(--muted); font-size: 13px; text-decoration: none; }
+    a.back:hover { color: var(--text); }
+    @media (max-width: 820px) { .stage { grid-template-columns: 1fr; } #canvas { height: 400px; } }
+  </style>
+</head>
+<body>
+  <main class="wrap xwrap">
+    <header class="head">
+      <div class="mark">₿</div>
+      <div style="flex:1">
+        <h1>keyspace explorer</h1>
+        <p class="sub">walk the map of every possible private key — hover to scan, drag to pan, scroll to zoom</p>
+      </div>
+      <a class="back" href="/">← checker</a>
+    </header>
+
+    <div class="bar">
+      <div class="field">
+        <label>range</label>
+        <select id="mode">
+          <option value="full">full space · 1 … 2²⁵⁶</option>
+          <option value="custom">custom · 2ᵃ … 2ᵇ</option>
+        </select>
+      </div>
+      <div class="field" id="fa" style="display:none"><label>from 2^a</label><input id="expa" type="number" value="67" min="1" max="255" /></div>
+      <div class="field" id="fb" style="display:none"><label>to 2^b</label><input id="expb" type="number" value="69" min="2" max="256" /></div>
+      <div class="field" style="min-width:170px"><label>cursor size · <span id="csizeVal">8</span></label><input id="csize" type="range" value="8" min="1" max="128" step="1" /></div>
+      <button id="apply">apply range</button>
+      <button id="clearTrail">clear trail</button>
+    </div>
+
+    <div class="stage">
+      <canvas id="canvas"></canvas>
+      <div class="side">
+        <div class="kv" style="padding:10px">
+          <div class="k" style="margin-bottom:8px">minimap · whole range · click to jump</div>
+          <canvas id="minimap" width="272" height="272" style="width:100%;aspect-ratio:1;display:block;background:#0a0c10;border-radius:8px;cursor:pointer"></canvas>
+        </div>
+        <div class="kv"><div class="k">this screen covers</div><div class="v" id="kScreen">—</div></div>
+        <div class="metrics">
+          <div class="metric"><div class="k">cells checked</div><div class="v" id="mChecked">0</div></div>
+          <div class="metric"><div class="k">hits found</div><div class="v hit" id="mHits">0</div></div>
+        </div>
+        <div class="kv"><div class="k">cursor key (hex)</div><div class="v" id="kHex">—</div></div>
+        <div class="kv"><div class="k">explored of 2²⁵⁶</div><div class="v" id="kFrac">—</div></div>
+        <div class="kv samples-box"><div class="k">addresses under cursor</div><div id="samples"></div></div>
+        <div class="note" id="note">Hits are effectively impossible (~10⁻⁴¹ per cell). This is a tool for feeling the scale of the keyspace — not for finding coins.</div>
+      </div>
+    </div>
+    <p class="hint">Each cell is one private key. Moving the cursor derives the real Bitcoin address for every key in the square and checks it against 56.2M funded addresses. Green = funded (you will never see one). Scroll = zoom · Shift+scroll = cursor size · drag = pan. click minimap to teleport. Explored cells stay lit as a trail.</p>
+  </main>
+
+  <script src="explorer.js"></script>
+</body>
+</html>

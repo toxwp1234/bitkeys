@@ -1,0 +1,10 @@
+# Static site — no build step, no backend. Deploy this folder to Netlify
+# (drag-and-drop the folder, or point a Netlify site at it).
+[build]
+  publish = "."
+  command = ""
+
+[[headers]]
+  for = "/*.mjs"
+  [headers.values]
+    Content-Type = "text/javascript"

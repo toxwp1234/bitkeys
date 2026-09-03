@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# never commit the multi-GB snapshot / built artifacts
+data/

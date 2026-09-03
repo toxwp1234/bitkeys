@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cuvre · bitcoin address checker</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='%23f7931a'/></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="wrap">
+    <header class="head">
+      <div class="mark">₿</div>
+      <div style="flex:1">
+        <h1>cuvre</h1>
+        <p class="sub">Bloom&nbsp;→&nbsp;SQLite lookup over every funded Bitcoin address</p>
+      </div>
+      <a class="back" href="/explorer.html" style="color:var(--accent);font-size:13px;text-decoration:none">keyspace explorer →</a>
+    </header>
+
+    <section class="search">
+      <input id="addr" type="text" spellcheck="false" autocomplete="off"
+             placeholder="paste a Bitcoin address…  (1… / 3… / bc1…)" />
+      <button id="go">check</button>
+    </section>
+
+    <div class="samples">
+      <span>try:</span>
+      <button class="chip" data-addr="1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa">genesis</button>
+      <button class="chip" data-addr="34xp4vRoCGJym3xR7yCVPFHoCNxv4Twseo">richest wallet</button>
+      <button class="chip" data-addr="bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97">rich bech32</button>
+    </div>
+
+    <section id="result" class="result hidden" aria-live="polite"></section>
+
+    <footer id="stats" class="stats"></footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
