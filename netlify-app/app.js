@@ -424,10 +424,9 @@ $("#addrs").addEventListener("click", (e) => {
   const row = e.target.closest(".row"); if (!row || !lastScan) return;
   const i = +row.dataset.i, cols = lastScan.cols;      // patch is row-major
   const key = lastScan.k0 + BigInt(Math.floor(i / cols)) * lastScan.W + BigInt(i % cols);
-  const hex = "0x" + key.toString(16);
-  $("#picked").innerHTML = row.textContent + "<br>↳ " + hex +
-    " <span id='copied' style='color:var(--muted)'>· copied to clipboard</span>";
-  try { navigator.clipboard.writeText(hex); } catch (e) {}
+  const address = row.textContent;
+  $("#picked").innerHTML = address + " <span style='color:var(--muted)'>· address copied</span><br>↳ 0x" + key.toString(16);
+  try { navigator.clipboard.writeText(address); } catch (e) {}
 });
 
 // ---------- intro overlay ----------
