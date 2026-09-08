@@ -132,7 +132,8 @@
         <div class="k" style="margin-top:10px">go to · private key</div>
         <div class="go"><input id="gk" placeholder="0x… or number" /><button class="ghost" id="gok">Go</button></div>
       </div>
-      <div class="kv addr-list"><div class="k">addresses in last patch · click one to reveal its key</div><div id="addrs"></div>
+      <div class="kv addr-list"><div class="k">wallets in patch (<span id="addrCount">0</span>) · click one to reveal its key</div>
+        <div id="addrs" style="max-height:260px;overflow:auto;margin-top:4px"></div>
         <div id="picked" style="margin-top:8px;font-size:11px;color:var(--accent);word-break:break-all"></div></div>
       <button id="share" class="primary" style="width:100%">Share my result</button>
       <div class="note">These are real, valid Bitcoin addresses. They are all empty — a funded one is a ~10⁻⁴¹ event you will never see. This is a map for feeling the scale, not finding coins. Your progress is saved on this device.</div>

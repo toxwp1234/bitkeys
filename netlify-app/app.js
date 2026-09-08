@@ -123,7 +123,8 @@ function positionCursor() {
 }
 
 // ---------- scanning (client-side, on click only) ----------
-const worker = new Worker("derive.worker.js?v=3", { type: "module" });
+const worker = new Worker("derive.worker.js?v=5", { type: "module" });
+const DERIVE_CAP = 2048;   // max wallets derived+shown per patch (keeps huge pens snappy)
 let scanId = 0, pendingScan = null;
 
 function scanAt(x, y) {
@@ -144,17 +145,21 @@ function scanAt(x, y) {
   $("#mPatches").textContent = patches.length.toLocaleString("en-US");
   $("#kFrac").textContent = fracExplored();
   render();
-  // derive only the sample addresses we show (async, cheap regardless of pen)
+  // derive the actual patch cells (1:1): pen n -> n*n wallets, capped for huge pens
+  const rowsToDerive = Math.min(penC, Math.max(1, Math.floor(DERIVE_CAP / penC)));
   const id = ++scanId;
-  pendingScan = { id, k0 };
-  worker.postMessage({ id, k0: k0.toString(), count: 12 });
+  pendingScan = { id, k0, W, cols: penC, total: penC * penC };
+  worker.postMessage({ id, k0: k0.toString(), stride: W.toString(), cols: penC, rows: rowsToDerive });
 }
 
 worker.onmessage = (e) => {
   const { id, addrs } = e.data;
   if (!pendingScan || pendingScan.id !== id) return;
-  lastScan = { k0: pendingScan.k0 };
+  lastScan = { k0: pendingScan.k0, W: pendingScan.W, cols: pendingScan.cols };
   $("#addrs").innerHTML = addrs.map((a, i) => `<div class="row" data-i="${i}">${a}</div>`).join("");
+  $("#addrCount").textContent = addrs.length < pendingScan.total
+    ? addrs.length.toLocaleString("en-US") + " of " + pendingScan.total.toLocaleString("en-US")
+    : addrs.length.toLocaleString("en-US");
   $("#picked").textContent = "";
 };
 
@@ -367,7 +372,8 @@ $("#goxy").addEventListener("click", () => { try { goTo(BigInt($("#gx").value ||
 $("#gok").addEventListener("click", () => { try { let k = BigInt($("#gk").value); if (k < 1n) k = 1n; const i = k - 1n; goTo(i % W, i / W); } catch (e) {} });
 $("#addrs").addEventListener("click", (e) => {
   const row = e.target.closest(".row"); if (!row || !lastScan) return;
-  const key = lastScan.k0 + BigInt(+row.dataset.i);   // sample is k0, k0+1, …
+  const i = +row.dataset.i, cols = lastScan.cols;      // patch is row-major
+  const key = lastScan.k0 + BigInt(Math.floor(i / cols)) * lastScan.W + BigInt(i % cols);
   $("#picked").innerHTML = row.textContent + "<br>↳ 0x" + key.toString(16);
 });
 
