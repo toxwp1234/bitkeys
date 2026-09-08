@@ -3,7 +3,19 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>keyspace map · every bitcoin wallet</title>
+  <title>Bitcoin Keyspace Map — walk all 2²⁵⁶ possible wallets</title>
+  <meta name="description" content="An interactive map of the entire Bitcoin private-key space — all 2^256 of them. Click to derive real addresses, teleport by coordinates or private key, and see why brute-forcing a funded wallet is impossible (~10^-41 per try). An educational scale visualizer, not a coin finder." />
+  <meta name="keywords" content="bitcoin, private key, keyspace, secp256k1, bitcoin address, cryptography, visualization, wallet, brute force" />
+  <meta name="robots" content="index,follow" />
+  <link rel="canonical" href="https://bitkeys.kifit.pl/" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Bitcoin Keyspace Map — walk all 2²⁵⁶ possible wallets" />
+  <meta property="og:description" content="Click across the whole Bitcoin key space, derive real addresses, and feel just how impossible it is to ever land on a funded one." />
+  <meta property="og:url" content="https://bitkeys.kifit.pl/" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"WebApplication","name":"Bitcoin Keyspace Map","url":"https://bitkeys.kifit.pl/","applicationCategory":"EducationalApplication","operatingSystem":"Any (web browser)","description":"An interactive, client-side map of the entire Bitcoin private-key space (2^256 keys). Users pan/zoom, click to derive real P2PKH addresses in-browser via secp256k1, and teleport by coordinates or key. A scale visualizer demonstrating why the Bitcoin keyspace cannot be brute-forced.","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
+  </script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='%23f7931a'/></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -127,10 +139,14 @@
         <div class="k" style="margin-top:8px">location · cursor cell</div>
         <div class="v" id="loc" style="font-size:11px">x — · y —</div></div>
       <div class="kv">
-        <div class="k">go to · coordinates (hex or dec)</div>
-        <div class="go"><input id="gx" placeholder="x" /><input id="gy" placeholder="y" /><button class="ghost" id="goxy">Go</button></div>
-        <div class="k" style="margin-top:10px">go to · private key</div>
-        <div class="go"><input id="gk" placeholder="0x… or number" /><button class="ghost" id="gok">Go</button></div>
+        <div class="k" style="display:flex;justify-content:space-between;align-items:center">go to
+          <select id="base" style="background:var(--panel2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:11px;padding:3px 5px;border-radius:6px">
+            <option value="auto">auto</option><option value="hex">hex</option><option value="dec">dec</option><option value="bin">bin</option>
+          </select></div>
+        <div class="go" style="margin-top:8px"><input id="gx" placeholder="x" /><input id="gy" placeholder="y" /><button class="ghost" id="goxy">Go</button></div>
+        <div class="go"><input id="gk" placeholder="private key" /><button class="ghost" id="gok">Go</button></div>
+        <div id="goErr" style="color:#f0616d;font-size:11px;margin-top:6px;display:none"></div>
+        <button class="ghost" id="calc" style="margin-top:8px;width:100%">Key → address…</button>
       </div>
       <div class="kv addr-list"><div class="k">wallets in patch (<span id="addrCount">0</span>) · click one to reveal its key</div>
         <div id="addrs" style="max-height:260px;overflow:auto;margin-top:4px"></div>
@@ -138,6 +154,16 @@
       <button id="share" class="primary" style="width:100%">Share my result</button>
       <div class="note">These are real, valid Bitcoin addresses. They are all empty — a funded one is a ~10⁻⁴¹ event you will never see. This is a map for feeling the scale, not finding coins. Your progress is saved on this device.</div>
     </aside>
+  </div>
+  <div id="calcModal" class="hidden" style="position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;background:rgba(10,12,16,.74);backdrop-filter:blur(3px);padding:20px">
+    <div style="max-width:460px;width:100%;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:22px 24px">
+      <h2 style="margin:0 0 8px;font-size:18px;font-weight:600">Key → address</h2>
+      <p style="margin:0 0 12px;color:var(--muted);font-size:13px;line-height:1.6">Enter a private key (use the base selector) and get its Bitcoin address. Reverse — address → key — is impossible; that's the whole point of the map.</p>
+      <input id="calcKey" placeholder="0x… / decimal / binary" style="width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:13px;padding:9px 10px;border-radius:8px;outline:none" />
+      <div class="go" style="margin-top:10px"><button class="primary" id="calcGo">Compute</button><button class="ghost" id="calcClose">Close</button></div>
+      <div id="calcErr" style="color:#f0616d;font-size:12px;margin-top:8px"></div>
+      <div id="calcOut" style="font-family:var(--mono);font-size:12px;color:var(--text);margin-top:8px;word-break:break-all"></div>
+    </div>
   </div>
   <script src="app.js"></script>
 </body>

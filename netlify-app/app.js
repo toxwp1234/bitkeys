@@ -19,6 +19,7 @@ let W = 2n ** aX, H = 2n ** aY;
 let cellPx = 28, minCell = 1.2, maxCell = 160;
 let raw = false;
 let lastScan = null;
+let landing = null;   // last teleport target, drawn as a red marker
 let viewX = 0n, viewY = 0n, subX = 0, subY = 0;
 let penC = 16;
 let patches = [];                 // {x,y,c} solid scanned squares
@@ -80,6 +81,13 @@ function draw() {
     const s = p.c * cellPx;
     if (sx > w || sy > h || sx + s < 0 || sy + s < 0) continue;
     tctx.fillRect(sx, sy, s, s);
+  }
+  if (landing) {   // red marker: where you just teleported
+    const lx = Number(landing.x - viewX) * cellPx - subX;
+    const ly = Number(landing.y - viewY) * cellPx - subY;
+    const s = Math.max(penC * cellPx, 10);
+    tctx.fillStyle = "rgba(240,97,109,0.18)"; tctx.fillRect(lx, ly, s, s);
+    tctx.strokeStyle = "#f0616d"; tctx.lineWidth = 2; tctx.strokeRect(lx + 0.5, ly + 0.5, s - 1, s - 1);
   }
   drawMinimap();
   positionCursor();
@@ -154,6 +162,10 @@ function scanAt(x, y) {
 
 worker.onmessage = (e) => {
   const { id, addrs } = e.data;
+  if (pendingCalc && id === pendingCalc.id) {
+    $("#calcOut").innerHTML = "0x" + pendingCalc.k.toString(16) + "<br>↳ " + addrs[0];
+    pendingCalc = null; return;
+  }
   if (!pendingScan || pendingScan.id !== id) return;
   lastScan = { k0: pendingScan.k0, W: pendingScan.W, cols: pendingScan.cols };
   $("#addrs").innerHTML = addrs.map((a, i) => `<div class="row" data-i="${i}">${a}</div>`).join("");
@@ -343,6 +355,7 @@ function goTo(cx, cy) {
   const vr = Math.floor(stage.clientHeight / cellPx / 2) || 0;
   viewX = clampB(cx - BigInt(vc), 0n, W);
   viewY = clampB(cy - BigInt(vr), 0n, H);
+  landing = { x: cx, y: cy };
   subX = 0; subY = 0; normalize(); render();
 }
 function updateURL() {
@@ -368,8 +381,44 @@ function randBig(maxExclusive) {
   return v % maxExclusive;
 }
 $("#rand").addEventListener("click", () => goTo(randBig(W), randBig(H)));
-$("#goxy").addEventListener("click", () => { try { goTo(BigInt($("#gx").value || "0"), BigInt($("#gy").value || "0")); } catch (e) {} });
-$("#gok").addEventListener("click", () => { try { let k = BigInt($("#gk").value); if (k < 1n) k = 1n; const i = k - 1n; goTo(i % W, i / W); } catch (e) {} });
+// parse a value in the chosen base (auto understands 0x / 0b / decimal)
+function parseVal(str, base) {
+  str = (str || "").trim(); if (!str) return null;
+  try {
+    if (base === "hex") return BigInt(/^0x/i.test(str) ? str : "0x" + str);
+    if (base === "bin") return BigInt(/^0b/i.test(str) ? str : "0b" + str);
+    return BigInt(str);
+  } catch (e) { return null; }
+}
+function goErr(msg) { const el = $("#goErr"); if (!msg) { el.style.display = "none"; return; } el.textContent = msg; el.style.display = "block"; }
+$("#goxy").addEventListener("click", () => {
+  const b = $("#base").value;
+  const x = parseVal($("#gx").value, b), y = parseVal($("#gy").value, b);
+  if (x === null || y === null) return goErr("Invalid number for base “" + b + "”.");
+  if (x < 0n || x >= W) return goErr("x out of range (0 … 2^" + aX + " − 1).");
+  if (y < 0n || y >= H) return goErr("y out of range (0 … 2^" + aY + " − 1).");
+  goErr(""); goTo(x, y);
+});
+$("#gok").addEventListener("click", () => {
+  const b = $("#base").value;
+  const k = parseVal($("#gk").value, b), max = W * H;
+  if (k === null) return goErr("Invalid key for base “" + b + "”.");
+  if (k < 1n || k > max) return goErr("Key out of range (1 … 2^" + (aX + aY) + ").");
+  goErr(""); const i = k - 1n; goTo(i % W, i / W);
+});
+
+// ---------- key -> address modal ----------
+let calcId = 0, pendingCalc = null;
+$("#calc").addEventListener("click", () => { $("#calcErr").textContent = ""; $("#calcOut").textContent = ""; $("#calcModal").classList.remove("hidden"); });
+$("#calcClose").addEventListener("click", () => $("#calcModal").classList.add("hidden"));
+$("#calcGo").addEventListener("click", () => {
+  const k = parseVal($("#calcKey").value, $("#base").value), max = W * H;
+  if (k === null) { $("#calcErr").textContent = "Invalid number for the selected base."; return; }
+  if (k < 1n || k > max) { $("#calcErr").textContent = "Out of range (1 … 2^" + (aX + aY) + ")."; return; }
+  $("#calcErr").textContent = ""; $("#calcOut").textContent = "computing…";
+  const id = "c" + (++calcId); pendingCalc = { id, k };
+  worker.postMessage({ id, k0: k.toString(), stride: "1", cols: 1, rows: 1 });
+});
 $("#addrs").addEventListener("click", (e) => {
   const row = e.target.closest(".row"); if (!row || !lastScan) return;
   const i = +row.dataset.i, cols = lastScan.cols;      // patch is row-major
