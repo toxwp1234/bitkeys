@@ -409,8 +409,9 @@ $("#gok").addEventListener("click", () => {
 
 // ---------- key -> address modal ----------
 let calcId = 0, pendingCalc = null;
-$("#calc").addEventListener("click", () => { $("#calcErr").textContent = ""; $("#calcOut").textContent = ""; $("#calcModal").classList.remove("hidden"); });
-$("#calcClose").addEventListener("click", () => $("#calcModal").classList.add("hidden"));
+$("#calc").addEventListener("click", () => { $("#calcErr").textContent = ""; $("#calcOut").textContent = ""; $("#calcModal").style.display = "flex"; });
+$("#calcClose").addEventListener("click", () => { $("#calcModal").style.display = "none"; });
+$("#calcModal").addEventListener("click", (e) => { if (e.target === $("#calcModal")) $("#calcModal").style.display = "none"; });
 $("#calcGo").addEventListener("click", () => {
   const k = parseVal($("#calcKey").value, $("#base").value), max = W * H;
   if (k === null) { $("#calcErr").textContent = "Invalid number for the selected base."; return; }
@@ -423,7 +424,10 @@ $("#addrs").addEventListener("click", (e) => {
   const row = e.target.closest(".row"); if (!row || !lastScan) return;
   const i = +row.dataset.i, cols = lastScan.cols;      // patch is row-major
   const key = lastScan.k0 + BigInt(Math.floor(i / cols)) * lastScan.W + BigInt(i % cols);
-  $("#picked").innerHTML = row.textContent + "<br>↳ 0x" + key.toString(16);
+  const hex = "0x" + key.toString(16);
+  $("#picked").innerHTML = row.textContent + "<br>↳ " + hex +
+    " <span id='copied' style='color:var(--muted)'>· copied to clipboard</span>";
+  try { navigator.clipboard.writeText(hex); } catch (e) {}
 });
 
 // ---------- intro overlay ----------
