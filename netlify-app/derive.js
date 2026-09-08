@@ -29,6 +29,20 @@ export function deriveAddress(k) {
   return p2pkhFromPub(ProjectivePoint.BASE.multiply(k).toRawBytes(true));
 }
 
+// Derive `count` consecutive addresses starting at k0 (k0, k0+1, …). One full
+// multiply, then cheap +G steps. We only ever display a handful, so this is all
+// we compute — no need to derive a whole penC*penC patch.
+export function deriveSample(k0, count) {
+  const G = ProjectivePoint.BASE;
+  let p = G.multiply(k0);
+  const out = new Array(count);
+  for (let i = 0; i < count; i++) {
+    out[i] = p2pkhFromPub(p.toRawBytes(true));
+    if (i < count - 1) p = p.add(G);
+  }
+  return out;
+}
+
 // Contiguous row-major block: cell (c,r) = k0 + r*stride + c.
 // Uses one full multiply per row start, then +G per column (cheap neighbour add).
 export function deriveBlock(k0, stride, cols, rows) {

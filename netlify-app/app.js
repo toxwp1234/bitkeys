@@ -123,7 +123,7 @@ function positionCursor() {
 }
 
 // ---------- scanning (client-side, on click only) ----------
-const worker = new Worker("derive.worker.js", { type: "module" });
+const worker = new Worker("derive.worker.js?v=3", { type: "module" });
 let scanId = 0, pendingScan = null;
 
 function scanAt(x, y) {
@@ -132,16 +132,7 @@ function scanAt(x, y) {
   const kh = $("#kHex");
   kh.textContent = shortHex(k0, 8, 8);
   kh.title = "0x" + k0.toString(16);
-  const id = ++scanId;
-  pendingScan = { id, x, y, key, c: penC, W };
-  worker.postMessage({ id, k0: k0.toString(), stride: W.toString(), cols: penC, rows: penC });
-}
-
-worker.onmessage = (e) => {
-  const { id, addrs } = e.data;
-  if (!pendingScan || pendingScan.id !== id) return;
-  const { x, y, key } = pendingScan;
-  lastScan = { k0: kAt(x, y), cols: pendingScan.c, W: pendingScan.W };
+  // optimistic: paint the patch + counters instantly, whatever the pen size
   if (!seen.has(key)) {
     seen.add(key);
     patches.push({ x, y, c: penC });
@@ -152,9 +143,19 @@ worker.onmessage = (e) => {
   $("#mScanned").textContent = keysScanned.toLocaleString("en-US");
   $("#mPatches").textContent = patches.length.toLocaleString("en-US");
   $("#kFrac").textContent = fracExplored();
-  $("#addrs").innerHTML = addrs.slice(0, 8).map((a, i) => `<div class="row" data-i="${i}">${a}</div>`).join("");
-  $("#picked").textContent = "";
   render();
+  // derive only the sample addresses we show (async, cheap regardless of pen)
+  const id = ++scanId;
+  pendingScan = { id, k0 };
+  worker.postMessage({ id, k0: k0.toString(), count: 12 });
+}
+
+worker.onmessage = (e) => {
+  const { id, addrs } = e.data;
+  if (!pendingScan || pendingScan.id !== id) return;
+  lastScan = { k0: pendingScan.k0 };
+  $("#addrs").innerHTML = addrs.map((a, i) => `<div class="row" data-i="${i}">${a}</div>`).join("");
+  $("#picked").textContent = "";
 };
 
 function fracExplored() {
@@ -353,13 +354,20 @@ function applyURLGoto() {
   const p = new URLSearchParams(location.search);
   if (p.has("x") && p.has("y")) { try { goTo(BigInt(p.get("x")), BigInt(p.get("y"))); } catch (e) {} }
 }
+// cryptographically-random BigInt in [0, maxExclusive)
+function randBig(maxExclusive) {
+  const bits = maxExclusive.toString(2).length;
+  const bytes = Math.ceil(bits / 8) || 1;
+  const arr = crypto.getRandomValues(new Uint8Array(bytes));
+  let v = 0n; for (const b of arr) v = (v << 8n) + BigInt(b);
+  return v % maxExclusive;
+}
+$("#rand").addEventListener("click", () => goTo(randBig(W), randBig(H)));
 $("#goxy").addEventListener("click", () => { try { goTo(BigInt($("#gx").value || "0"), BigInt($("#gy").value || "0")); } catch (e) {} });
 $("#gok").addEventListener("click", () => { try { let k = BigInt($("#gk").value); if (k < 1n) k = 1n; const i = k - 1n; goTo(i % W, i / W); } catch (e) {} });
 $("#addrs").addEventListener("click", (e) => {
   const row = e.target.closest(".row"); if (!row || !lastScan) return;
-  const i = +row.dataset.i, cols = lastScan.cols;
-  const r = Math.floor(i / cols), c = i % cols;
-  const key = lastScan.k0 + BigInt(r) * lastScan.W + BigInt(c);
+  const key = lastScan.k0 + BigInt(+row.dataset.i);   // sample is k0, k0+1, …
   $("#picked").innerHTML = row.textContent + "<br>↳ 0x" + key.toString(16);
 });
 
