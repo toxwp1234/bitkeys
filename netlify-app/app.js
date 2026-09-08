@@ -18,6 +18,7 @@ let aX = 128n, aY = 128n;
 let W = 2n ** aX, H = 2n ** aY;
 let cellPx = 28, minCell = 1.2, maxCell = 160;
 let raw = false;
+let lastScan = null;
 let viewX = 0n, viewY = 0n, subX = 0, subY = 0;
 let penC = 16;
 let patches = [];                 // {x,y,c} solid scanned squares
@@ -132,7 +133,7 @@ function scanAt(x, y) {
   kh.textContent = shortHex(k0, 8, 8);
   kh.title = "0x" + k0.toString(16);
   const id = ++scanId;
-  pendingScan = { id, x, y, key };
+  pendingScan = { id, x, y, key, c: penC, W };
   worker.postMessage({ id, k0: k0.toString(), stride: W.toString(), cols: penC, rows: penC });
 }
 
@@ -140,6 +141,7 @@ worker.onmessage = (e) => {
   const { id, addrs } = e.data;
   if (!pendingScan || pendingScan.id !== id) return;
   const { x, y, key } = pendingScan;
+  lastScan = { k0: kAt(x, y), cols: pendingScan.c, W: pendingScan.W };
   if (!seen.has(key)) {
     seen.add(key);
     patches.push({ x, y, c: penC });
@@ -150,7 +152,8 @@ worker.onmessage = (e) => {
   $("#mScanned").textContent = keysScanned.toLocaleString("en-US");
   $("#mPatches").textContent = patches.length.toLocaleString("en-US");
   $("#kFrac").textContent = fracExplored();
-  $("#addrs").innerHTML = addrs.slice(0, 8).map((a) => `<div class="row">${a}</div>`).join("");
+  $("#addrs").innerHTML = addrs.slice(0, 8).map((a, i) => `<div class="row" data-i="${i}">${a}</div>`).join("");
+  $("#picked").textContent = "";
   render();
 };
 
@@ -263,6 +266,7 @@ function saveState() {
       patches: kept.map((p) => [p.x.toString(), p.y.toString(), p.c]),
     }));
   } catch (e) { /* private mode / quota — ignore */ }
+  updateURL();
 }
 function rebuildHeat() {
   fillHeatBg();
@@ -326,6 +330,39 @@ $("#share").addEventListener("click", async () => {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 });
 
+// ---------- go to / teleport + shareable URL position ----------
+function goTo(cx, cy) {
+  cx = clampB(cx, 0n, W); cy = clampB(cy, 0n, H);
+  const vc = Math.floor(stage.clientWidth / cellPx / 2) || 0;
+  const vr = Math.floor(stage.clientHeight / cellPx / 2) || 0;
+  viewX = clampB(cx - BigInt(vc), 0n, W);
+  viewY = clampB(cy - BigInt(vr), 0n, H);
+  subX = 0; subY = 0; normalize(); render();
+}
+function updateURL() {
+  try {
+    const cx = viewX + BigInt(Math.floor((stage.clientWidth / cellPx) / 2));
+    const cy = viewY + BigInt(Math.floor((stage.clientHeight / cellPx) / 2));
+    const u = new URL(location.href);
+    u.searchParams.set("x", "0x" + cx.toString(16));
+    u.searchParams.set("y", "0x" + cy.toString(16));
+    history.replaceState(null, "", u.toString());
+  } catch (e) {}
+}
+function applyURLGoto() {
+  const p = new URLSearchParams(location.search);
+  if (p.has("x") && p.has("y")) { try { goTo(BigInt(p.get("x")), BigInt(p.get("y"))); } catch (e) {} }
+}
+$("#goxy").addEventListener("click", () => { try { goTo(BigInt($("#gx").value || "0"), BigInt($("#gy").value || "0")); } catch (e) {} });
+$("#gok").addEventListener("click", () => { try { let k = BigInt($("#gk").value); if (k < 1n) k = 1n; const i = k - 1n; goTo(i % W, i / W); } catch (e) {} });
+$("#addrs").addEventListener("click", (e) => {
+  const row = e.target.closest(".row"); if (!row || !lastScan) return;
+  const i = +row.dataset.i, cols = lastScan.cols;
+  const r = Math.floor(i / cols), c = i % cols;
+  const key = lastScan.k0 + BigInt(r) * lastScan.W + BigInt(c);
+  $("#picked").innerHTML = row.textContent + "<br>↳ 0x" + key.toString(16);
+});
+
 // ---------- intro overlay ----------
 function hideIntro() { $("#intro").classList.add("hidden"); try { localStorage.setItem("cuvre-intro-seen", "1"); } catch (e) {} }
 $("#introGo").addEventListener("click", hideIntro);
@@ -335,3 +372,4 @@ try { if (localStorage.getItem("cuvre-intro-seen") === "1") $("#intro").classLis
 window.addEventListener("resize", resize);
 loadState();
 resize();
+applyURLGoto();
