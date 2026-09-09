@@ -160,6 +160,15 @@ function scanAt(x, y) {
   worker.postMessage({ id, k0: k0.toString(), stride: W.toString(), cols: penC, rows: rowsToDerive });
 }
 
+// live balance for a single address (only when pen == 1) via a fast public API
+async function liveBalance(addr) {
+  try {
+    const r = await (await fetch("https://mempool.space/api/address/" + addr)).json();
+    const c = r.chain_stats, m = r.mempool_stats;
+    return (c.funded_txo_sum - c.spent_txo_sum) + (m.funded_txo_sum - m.spent_txo_sum);
+  } catch (e) { return null; }
+}
+
 worker.onmessage = (e) => {
   const { id, addrs } = e.data;
   if (pendingCalc && id === pendingCalc.id) {
@@ -173,6 +182,17 @@ worker.onmessage = (e) => {
     ? addrs.length.toLocaleString("en-US") + " of " + pendingScan.total.toLocaleString("en-US")
     : addrs.length.toLocaleString("en-US");
   $("#picked").textContent = "";
+  $("#live").textContent = "";
+  if (pendingScan.cols === 1 && addrs[0]) {   // pen == 1 -> real live balance check
+    const myId = id, addr = addrs[0];
+    $("#live").innerHTML = "<span style='color:var(--muted)'>checking live balance…</span>";
+    liveBalance(addr).then((sat) => {
+      if (!pendingScan || pendingScan.id !== myId) return;   // a newer click superseded this
+      if (sat === null) $("#live").innerHTML = "<span style='color:var(--muted)'>live check failed (rate limit) — retry</span>";
+      else if (sat > 0) $("#live").innerHTML = "<span style='color:#3fb950'>★ FUNDED · " + (sat / 1e8).toFixed(8) + " BTC (live)</span>";
+      else $("#live").innerHTML = "<span style='color:var(--muted)'>live balance: 0 BTC · empty</span>";
+    });
+  }
 };
 
 function fracExplored() {

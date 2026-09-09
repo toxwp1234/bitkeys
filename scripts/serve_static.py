@@ -7,4 +7,4 @@ mimetypes.add_type("text/javascript", ".mjs")
 mimetypes.add_type("text/javascript", ".js")
 
 Handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory="netlify-app")
-http.server.HTTPServer(("127.0.0.1", 8001), Handler).serve_forever()
+http.server.ThreadingHTTPServer(("127.0.0.1", 8001), Handler).serve_forever()
