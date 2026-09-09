@@ -169,6 +169,37 @@ async function liveBalance(addr) {
   } catch (e) { return null; }
 }
 
+let btcPrice = 0;
+fetch("https://mempool.space/api/v1/prices").then((r) => r.json()).then((d) => { btcPrice = d.USD || 0; }).catch(() => {});
+let balToken = 0;
+function setBalCard(state, addr, sat) {
+  const card = $("#balanceCard"); card.className = "balcard " + state;
+  $("#balAddr").textContent = addr || "";
+  const link = $("#balLink");
+  if (addr) { link.style.display = "inline"; link.href = "https://mempool.space/address/" + addr; }
+  else link.style.display = "none";
+  if (state === "checking") { $("#balState").textContent = "checking live balance…"; $("#balBtc").textContent = "…"; $("#balUsd").textContent = ""; return; }
+  if (state === "error") { $("#balState").textContent = "check failed (rate limit) — click again"; $("#balBtc").textContent = "—"; $("#balUsd").textContent = ""; return; }
+  const btc = sat / 1e8;
+  $("#balBtc").textContent = btc.toFixed(8) + " BTC";
+  $("#balUsd").textContent = btcPrice ? "≈ $" + (btc * btcPrice).toLocaleString("en-US", { maximumFractionDigits: 2 }) : "";
+  $("#balState").textContent = state === "funded" ? "★ funded wallet" : "empty wallet";
+}
+function resetBalCard() {
+  balToken++; $("#balanceCard").className = "balcard idle";
+  $("#balState").textContent = "click a wallet to check its live balance";
+  $("#balBtc").textContent = "— BTC"; $("#balUsd").textContent = "";
+  $("#balAddr").textContent = ""; $("#balLink").style.display = "none";
+}
+function showBalance(addr) {
+  const token = ++balToken;
+  setBalCard("checking", addr, null);
+  liveBalance(addr).then((sat) => {
+    if (token !== balToken) return;                 // a newer click superseded this
+    setBalCard(sat === null ? "error" : (sat > 0 ? "funded" : "empty"), addr, sat);
+  });
+}
+
 worker.onmessage = (e) => {
   const { id, addrs } = e.data;
   if (pendingCalc && id === pendingCalc.id) {
@@ -182,17 +213,8 @@ worker.onmessage = (e) => {
     ? addrs.length.toLocaleString("en-US") + " of " + pendingScan.total.toLocaleString("en-US")
     : addrs.length.toLocaleString("en-US");
   $("#picked").textContent = "";
-  $("#live").textContent = "";
-  if (pendingScan.cols === 1 && addrs[0]) {   // pen == 1 -> real live balance check
-    const myId = id, addr = addrs[0];
-    $("#live").innerHTML = "<span style='color:var(--muted)'>checking live balance…</span>";
-    liveBalance(addr).then((sat) => {
-      if (!pendingScan || pendingScan.id !== myId) return;   // a newer click superseded this
-      if (sat === null) $("#live").innerHTML = "<span style='color:var(--muted)'>live check failed (rate limit) — retry</span>";
-      else if (sat > 0) $("#live").innerHTML = "<span style='color:#3fb950'>★ FUNDED · " + (sat / 1e8).toFixed(8) + " BTC (live)</span>";
-      else $("#live").innerHTML = "<span style='color:var(--muted)'>live balance: 0 BTC · empty</span>";
-    });
-  }
+  if (pendingScan.cols === 1 && addrs[0]) showBalance(addrs[0]);   // pen 1 -> auto-check
+  else resetBalCard();
 };
 
 function fracExplored() {
@@ -447,6 +469,7 @@ $("#addrs").addEventListener("click", (e) => {
   const address = row.textContent;
   $("#picked").innerHTML = address + " <span style='color:var(--muted)'>· address copied</span><br>↳ 0x" + key.toString(16);
   try { navigator.clipboard.writeText(address); } catch (e) {}
+  showBalance(address);   // clicking any wallet also checks its live balance
 });
 
 // ---------- intro overlay ----------

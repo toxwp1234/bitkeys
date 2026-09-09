@@ -71,6 +71,19 @@
     #minimap{width:100%;aspect-ratio:1;display:block;background:#0a0c10;border-radius:8px;cursor:pointer}
     .addr-list .row{font-family:var(--mono);font-size:11px;color:var(--muted);padding:3px 0;word-break:break-all;cursor:pointer}
     .addr-list .row:hover{color:var(--text)}
+    .balcard{border-radius:12px;padding:16px 16px 14px;border:1px solid var(--border);background:var(--panel);transition:border-color .2s,box-shadow .2s,background .2s}
+    .balcard .bal-state{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);margin-bottom:7px}
+    .balcard .bal-btc{font-family:var(--mono);font-size:26px;font-weight:500;color:var(--text);line-height:1.1}
+    .balcard .bal-usd{font-family:var(--mono);font-size:13px;color:var(--muted);margin-top:3px}
+    .balcard .bal-addr{font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:9px;word-break:break-all}
+    .balcard a{color:var(--accent);text-decoration:none;margin-top:8px}
+    .balcard.checking{animation:balpulse 1s ease-in-out infinite}
+    .balcard.checking .bal-state{color:var(--accent)}
+    .balcard.empty{border-color:#2a3340}
+    .balcard.error .bal-state{color:#f0616d}
+    .balcard.funded{border-color:#3fb950;background:rgba(63,185,80,.10);box-shadow:0 0 26px -6px #3fb950}
+    .balcard.funded .bal-state,.balcard.funded .bal-btc{color:#3fb950}
+    @keyframes balpulse{0%,100%{opacity:1}50%{opacity:.55}}
     .go{display:flex;gap:6px;margin-top:6px}
     .go input{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 8px;border-radius:8px;outline:none}
     .note{background:var(--panel);border-left:3px solid var(--accent);border-radius:0 8px 8px 0;padding:9px 11px;font-size:11px;color:var(--muted);line-height:1.55}
@@ -128,6 +141,13 @@
     </div>
 
     <aside>
+      <div id="balanceCard" class="balcard idle">
+        <div class="bal-state" id="balState">click a wallet to check its live balance</div>
+        <div class="bal-btc" id="balBtc">— BTC</div>
+        <div class="bal-usd" id="balUsd"></div>
+        <a id="balLink" href="#" target="_blank" rel="noopener" style="display:none;font-size:11px">verify on mempool.space ↗</a>
+        <div class="bal-addr" id="balAddr"></div>
+      </div>
       <div class="metrics">
         <div class="metric"><div class="k">keys scanned</div><div class="v" id="mScanned">0</div></div>
         <div class="metric"><div class="k">patches</div><div class="v" id="mPatches">0</div></div>
@@ -149,8 +169,7 @@
         <button class="ghost" id="calc" style="margin-top:8px;width:100%">Key → address…</button>
       </div>
       <div class="kv addr-list"><div class="k">wallets in patch (<span id="addrCount">0</span>) · click one to reveal its key</div>
-        <div id="addrs" style="max-height:260px;overflow:auto;margin-top:4px"></div>
-        <div id="live" style="margin-top:6px;font-size:12px;word-break:break-all"></div>
+        <div id="addrs" style="max-height:220px;overflow:auto;margin-top:4px"></div>
         <div id="picked" style="margin-top:6px;font-size:11px;color:var(--accent);word-break:break-all"></div></div>
       <button id="share" class="primary" style="width:100%">Share my result</button>
       <div class="note">These are real, valid Bitcoin addresses. They are all empty — a funded one is a ~10⁻⁴¹ event you will never see. This is a map for feeling the scale, not finding coins. Your progress is saved on this device.</div>
