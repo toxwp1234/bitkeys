@@ -160,21 +160,55 @@ function scanAt(x, y) {
   worker.postMessage({ id, k0: k0.toString(), stride: W.toString(), cols: penC, rows: rowsToDerive });
 }
 
-// live balance for a single address (only when pen == 1) via a public block explorer.
-// mempool.space became unreachable, so we use blockstream.info (Esplora API — identical
-// chain_stats/mempool_stats schema) as the primary, with blockchain.info as a fallback.
+// live balance for a single address (only when pen == 1). No single free explorer
+// sustains 1 req/s forever (they throttle bursts / cap daily), so we ROTATE across
+// several public providers and space calls out client-side. A provider that rate-limits
+// is put on a short cooldown and skipped. Result is tagged so the UI can tell
+// "confirmed empty (0 BTC)" apart from "couldn't check (limit)" — the two must never look alike.
+const esploraSat = (j) => {
+  const c = j.chain_stats, m = j.mempool_stats;
+  return (c.funded_txo_sum - c.spent_txo_sum) + (m.funded_txo_sum - m.spent_txo_sum);
+};
+const PROVIDERS = [
+  { name: "blockstream", url: (a) => "https://blockstream.info/api/address/" + a, parse: esploraSat },
+  { name: "mempool",     url: (a) => "https://mempool.space/api/address/" + a,    parse: esploraSat },
+  { name: "blockchain",  url: (a) => "https://blockchain.info/balance?cors=true&active=" + a, parse: (j, a) => j[a].final_balance },
+  { name: "blockchair",  url: (a) => "https://api.blockchair.com/bitcoin/dashboards/address/" + a, parse: (j, a) => j.data[a].address.balance },
+];
+let provStart = 0;                 // rotate which provider we try first each call
+const RL_CODES = new Set([429, 430, 402, 403, 503]);
+
+// query one provider -> "ok" | "ratelimited" | "unreachable".
+// hard 6s timeout so an unreachable provider (e.g. a downed explorer) fails over fast
+// instead of hanging the whole check.
+async function tryProvider(p, addr) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 6000);
+  try {
+    const res = await fetch(p.url(addr), { signal: ctl.signal });
+    if (!res.ok) return { status: RL_CODES.has(res.status) ? "ratelimited" : "unreachable" };
+    const sat = p.parse(await res.json(), addr);
+    if (Number.isFinite(sat)) return { status: "ok", sat };
+    return { status: "unreachable" };            // 200 but shape we didn't understand — do NOT treat as 0
+  } catch (e) { return { status: "unreachable" }; }
+  finally { clearTimeout(t); }
+}
+
+// -> { status: "ok", sat } | { status: "ratelimited" } | { status: "error" }
 async function liveBalance(addr) {
-  try {
-    const r = await (await fetch("https://blockstream.info/api/address/" + addr)).json();
-    const c = r.chain_stats, m = r.mempool_stats;
-    return (c.funded_txo_sum - c.spent_txo_sum) + (m.funded_txo_sum - m.spent_txo_sum);
-  } catch (e) { /* fall through to secondary provider */ }
-  try {
-    const r = await (await fetch("https://blockchain.info/balance?cors=true&active=" + addr)).json();
-    const e = r[addr];
-    if (e && typeof e.final_balance === "number") return e.final_balance;
-  } catch (e) { /* both providers failed */ }
-  return null;
+  const now = Date.now();
+  const n = PROVIDERS.length;
+  provStart = (provStart + 1) % n;
+  let sawRateLimit = false;
+  // first pass: providers not on cooldown, starting at a rotating offset
+  for (let i = 0; i < n; i++) {
+    const p = PROVIDERS[(provStart + i) % n];
+    if (p.cooldownUntil && now < p.cooldownUntil) { sawRateLimit = true; continue; }
+    const r = await tryProvider(p, addr);
+    if (r.status === "ok") return r;
+    if (r.status === "ratelimited") { p.cooldownUntil = Date.now() + 60000; sawRateLimit = true; }
+  }
+  return { status: sawRateLimit ? "ratelimited" : "error" };
 }
 
 let btcPrice = 0;
@@ -197,7 +231,9 @@ function setBalCard(state, addr, sat, priv) {
   if (addr) { link.style.display = "inline"; link.href = "https://blockstream.info/address/" + addr; }
   else link.style.display = "none";
   if (state === "checking") { $("#balState").textContent = "checking live balance…"; gotCap.style.display = "none"; $("#balBtc").textContent = "…"; $("#balUsd").textContent = ""; return; }
-  if (state === "error") { $("#balState").textContent = "check failed (rate limit) — click again"; gotCap.style.display = "none"; $("#balBtc").textContent = "—"; $("#balUsd").textContent = ""; return; }
+  // "limit"/"error": balance is UNKNOWN — never render this as 0 BTC / empty, that would be misleading
+  if (state === "limit") { $("#balState").textContent = "not checked — API limit reached, try again in a moment"; gotCap.style.display = "none"; $("#balBtc").textContent = "balance unknown"; $("#balUsd").textContent = ""; return; }
+  if (state === "error") { $("#balState").textContent = "not checked — explorer unreachable, try again"; gotCap.style.display = "none"; $("#balBtc").textContent = "balance unknown"; $("#balUsd").textContent = ""; return; }
   const btc = sat / 1e8;
   gotCap.style.display = "block";
   $("#balBtc").textContent = btc.toFixed(8) + " BTC";
@@ -213,13 +249,22 @@ function resetBalCard() {
   $("#balKey").textContent = ""; $("#balKeyField").style.display = "none";
   $("#balLink").style.display = "none";
 }
-function showBalance(addr, priv) {
+// client-side rate limiter: keep live calls to <= 1/s so we never burn a provider's quota
+let nextSlot = 0;                                   // earliest timestamp we may fire the next call
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function showBalance(addr, priv) {
   const token = ++balToken;
   setBalCard("checking", addr, null, priv);
-  liveBalance(addr).then((sat) => {
-    if (token !== balToken) return;                 // a newer click superseded this
-    setBalCard(sat === null ? "error" : (sat > 0 ? "funded" : "empty"), addr, sat, priv);
-  });
+  const wait = Math.max(0, nextSlot - Date.now());
+  if (wait) await sleep(wait);
+  if (token !== balToken) return;                   // a faster click superseded us while waiting — don't spend a slot
+  nextSlot = Math.max(Date.now(), nextSlot) + 1000; // reserve this call's 1s slot
+  const res = await liveBalance(addr);
+  if (token !== balToken) return;                   // superseded during the request
+  const state = res.status === "ok" ? (res.sat > 0 ? "funded" : "empty")
+              : res.status === "ratelimited" ? "limit"
+              : "error";
+  setBalCard(state, addr, res.sat, priv);
 }
 
 worker.onmessage = (e) => {

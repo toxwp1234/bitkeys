@@ -84,7 +84,9 @@
     .balcard.checking{animation:balpulse 1s ease-in-out infinite}
     .balcard.checking .bal-state{color:var(--accent)}
     .balcard.empty{border-color:#2a3340}
-    .balcard.error .bal-state{color:#f0616d}
+    .balcard.error .bal-state,.balcard.limit .bal-state{color:#e0b155}
+    .balcard.error,.balcard.limit{border-color:#5a4a2a;background:rgba(224,177,85,.06)}
+    .balcard.error .bal-btc,.balcard.limit .bal-btc{font-size:14px;font-weight:400;color:var(--muted)}
     .balcard.funded{border-color:#3fb950;background:rgba(63,185,80,.10);box-shadow:0 0 26px -6px #3fb950}
     .balcard.funded .bal-state,.balcard.funded .bal-btc{color:#3fb950}
     @keyframes balpulse{0%,100%{opacity:1}50%{opacity:.55}}
