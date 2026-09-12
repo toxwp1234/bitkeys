@@ -160,23 +160,34 @@ function scanAt(x, y) {
   worker.postMessage({ id, k0: k0.toString(), stride: W.toString(), cols: penC, rows: rowsToDerive });
 }
 
-// live balance for a single address (only when pen == 1) via a fast public API
+// live balance for a single address (only when pen == 1) via a public block explorer.
+// mempool.space became unreachable, so we use blockstream.info (Esplora API — identical
+// chain_stats/mempool_stats schema) as the primary, with blockchain.info as a fallback.
 async function liveBalance(addr) {
   try {
-    const r = await (await fetch("https://mempool.space/api/address/" + addr)).json();
+    const r = await (await fetch("https://blockstream.info/api/address/" + addr)).json();
     const c = r.chain_stats, m = r.mempool_stats;
     return (c.funded_txo_sum - c.spent_txo_sum) + (m.funded_txo_sum - m.spent_txo_sum);
-  } catch (e) { return null; }
+  } catch (e) { /* fall through to secondary provider */ }
+  try {
+    const r = await (await fetch("https://blockchain.info/balance?cors=true&active=" + addr)).json();
+    const e = r[addr];
+    if (e && typeof e.final_balance === "number") return e.final_balance;
+  } catch (e) { /* both providers failed */ }
+  return null;
 }
 
 let btcPrice = 0;
-fetch("https://mempool.space/api/v1/prices").then((r) => r.json()).then((d) => { btcPrice = d.USD || 0; }).catch(() => {});
+fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot")
+  .then((r) => r.json())
+  .then((d) => { btcPrice = parseFloat(d && d.data && d.data.amount) || 0; })
+  .catch(() => {});
 let balToken = 0;
 function setBalCard(state, addr, sat) {
   const card = $("#balanceCard"); card.className = "balcard " + state;
   $("#balAddr").textContent = addr || "";
   const link = $("#balLink");
-  if (addr) { link.style.display = "inline"; link.href = "https://mempool.space/address/" + addr; }
+  if (addr) { link.style.display = "inline"; link.href = "https://blockstream.info/address/" + addr; }
   else link.style.display = "none";
   if (state === "checking") { $("#balState").textContent = "checking live balance…"; $("#balBtc").textContent = "…"; $("#balUsd").textContent = ""; return; }
   if (state === "error") { $("#balState").textContent = "check failed (rate limit) — click again"; $("#balBtc").textContent = "—"; $("#balUsd").textContent = ""; return; }
