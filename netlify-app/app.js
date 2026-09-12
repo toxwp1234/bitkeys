@@ -161,10 +161,11 @@ function scanAt(x, y) {
 }
 
 // live balance for a single address (only when pen == 1). No single free explorer
-// sustains 1 req/s forever (they throttle bursts / cap daily), so we ROTATE across
-// several public providers and space calls out client-side. A provider that rate-limits
-// is put on a short cooldown and skipped. Result is tagged so the UI can tell
-// "confirmed empty (0 BTC)" apart from "couldn't check (limit)" — the two must never look alike.
+// sustains 1 req/s forever (they throttle bursts / cap daily), so we RACE several
+// public providers in parallel and take the first that answers — a dead or slow one
+// (e.g. mempool timing out) can no longer stall the whole check. A provider that
+// rate-limits is put on a cooldown and skipped next time. Result is tagged so the UI
+// can tell "confirmed empty (0 BTC)" apart from "couldn't check (limit)" — never alike.
 const esploraSat = (j) => {
   const c = j.chain_stats, m = j.mempool_stats;
   return (c.funded_txo_sum - c.spent_txo_sum) + (m.funded_txo_sum - m.spent_txo_sum);
@@ -175,15 +176,14 @@ const PROVIDERS = [
   { name: "blockchain",  url: (a) => "https://blockchain.info/balance?cors=true&active=" + a, parse: (j, a) => j[a].final_balance },
   { name: "blockchair",  url: (a) => "https://api.blockchair.com/bitcoin/dashboards/address/" + a, parse: (j, a) => j.data[a].address.balance },
 ];
-let provStart = 0;                 // rotate which provider we try first each call
 const RL_CODES = new Set([429, 430, 402, 403, 503]);
 
 // query one provider -> "ok" | "ratelimited" | "unreachable".
-// hard 6s timeout so an unreachable provider (e.g. a downed explorer) fails over fast
-// instead of hanging the whole check.
+// hard 4s timeout so a downed explorer can't hold a slot open forever; with the
+// parallel race below, a live provider usually answers in well under a second anyway.
 async function tryProvider(p, addr) {
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), 6000);
+  const t = setTimeout(() => ctl.abort(), 4000);
   try {
     const res = await fetch(p.url(addr), { signal: ctl.signal });
     if (!res.ok) return { status: RL_CODES.has(res.status) ? "ratelimited" : "unreachable" };
@@ -195,20 +195,25 @@ async function tryProvider(p, addr) {
 }
 
 // -> { status: "ok", sat } | { status: "ratelimited" } | { status: "error" }
+// Query every live provider AT ONCE and resolve on the first real balance. A single
+// slow/dead endpoint (mempool has been timing out) used to add its full timeout to
+// every check because providers were tried one after another; racing them means the
+// wait is only as long as the fastest healthy provider (~0.1–0.5s).
 async function liveBalance(addr) {
   const now = Date.now();
-  const n = PROVIDERS.length;
-  provStart = (provStart + 1) % n;
-  let sawRateLimit = false;
-  // first pass: providers not on cooldown, starting at a rotating offset
-  for (let i = 0; i < n; i++) {
-    const p = PROVIDERS[(provStart + i) % n];
-    if (p.cooldownUntil && now < p.cooldownUntil) { sawRateLimit = true; continue; }
-    const r = await tryProvider(p, addr);
-    if (r.status === "ok") return r;
-    if (r.status === "ratelimited") { p.cooldownUntil = Date.now() + 60000; sawRateLimit = true; }
-  }
-  return { status: sawRateLimit ? "ratelimited" : "error" };
+  const active = PROVIDERS.filter((p) => !(p.cooldownUntil && now < p.cooldownUntil));
+  if (!active.length) return { status: "ratelimited" };   // everything is cooling down
+  let sawRateLimit = active.length < PROVIDERS.length;     // some were skipped on cooldown
+  return await new Promise((resolve) => {
+    let pending = active.length, settled = false;
+    active.forEach(async (p) => {
+      const r = await tryProvider(p, addr);
+      if (settled) return;
+      if (r.status === "ok") { settled = true; return resolve(r); }   // first good answer wins
+      if (r.status === "ratelimited") { p.cooldownUntil = Date.now() + 60000; sawRateLimit = true; }
+      if (--pending === 0) resolve({ status: sawRateLimit ? "ratelimited" : "error" });
+    });
+  });
 }
 
 let btcPrice = 0;
