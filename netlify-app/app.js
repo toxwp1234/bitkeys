@@ -183,15 +183,23 @@ fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot")
   .then((d) => { btcPrice = parseFloat(d && d.data && d.data.amount) || 0; })
   .catch(() => {});
 let balToken = 0;
-function setBalCard(state, addr, sat) {
+// a private key is a 256-bit scalar -> Bitcoin shows it as 64 hex chars (zero-padded)
+const privHex = (priv) => priv == null ? "" : "0x" + priv.toString(16).padStart(64, "0");
+function setBalCard(state, addr, sat, priv) {
   const card = $("#balanceCard"); card.className = "balcard " + state;
+  const addrField = $("#balAddrField"), keyField = $("#balKeyField"), gotCap = $("#balGotCap");
   $("#balAddr").textContent = addr || "";
+  addrField.style.display = addr ? "block" : "none";
+  const key = privHex(priv);
+  $("#balKey").textContent = key;
+  keyField.style.display = key ? "block" : "none";
   const link = $("#balLink");
   if (addr) { link.style.display = "inline"; link.href = "https://blockstream.info/address/" + addr; }
   else link.style.display = "none";
-  if (state === "checking") { $("#balState").textContent = "checking live balance…"; $("#balBtc").textContent = "…"; $("#balUsd").textContent = ""; return; }
-  if (state === "error") { $("#balState").textContent = "check failed (rate limit) — click again"; $("#balBtc").textContent = "—"; $("#balUsd").textContent = ""; return; }
+  if (state === "checking") { $("#balState").textContent = "checking live balance…"; gotCap.style.display = "none"; $("#balBtc").textContent = "…"; $("#balUsd").textContent = ""; return; }
+  if (state === "error") { $("#balState").textContent = "check failed (rate limit) — click again"; gotCap.style.display = "none"; $("#balBtc").textContent = "—"; $("#balUsd").textContent = ""; return; }
   const btc = sat / 1e8;
+  gotCap.style.display = "block";
   $("#balBtc").textContent = btc.toFixed(8) + " BTC";
   $("#balUsd").textContent = btcPrice ? "≈ $" + (btc * btcPrice).toLocaleString("en-US", { maximumFractionDigits: 2 }) : "";
   $("#balState").textContent = state === "funded" ? "★ funded wallet" : "empty wallet";
@@ -199,15 +207,18 @@ function setBalCard(state, addr, sat) {
 function resetBalCard() {
   balToken++; $("#balanceCard").className = "balcard idle";
   $("#balState").textContent = "click a wallet to check its live balance";
+  $("#balGotCap").style.display = "none";
   $("#balBtc").textContent = "— BTC"; $("#balUsd").textContent = "";
-  $("#balAddr").textContent = ""; $("#balLink").style.display = "none";
+  $("#balAddr").textContent = ""; $("#balAddrField").style.display = "none";
+  $("#balKey").textContent = ""; $("#balKeyField").style.display = "none";
+  $("#balLink").style.display = "none";
 }
-function showBalance(addr) {
+function showBalance(addr, priv) {
   const token = ++balToken;
-  setBalCard("checking", addr, null);
+  setBalCard("checking", addr, null, priv);
   liveBalance(addr).then((sat) => {
     if (token !== balToken) return;                 // a newer click superseded this
-    setBalCard(sat === null ? "error" : (sat > 0 ? "funded" : "empty"), addr, sat);
+    setBalCard(sat === null ? "error" : (sat > 0 ? "funded" : "empty"), addr, sat, priv);
   });
 }
 
@@ -224,7 +235,7 @@ worker.onmessage = (e) => {
     ? addrs.length.toLocaleString("en-US") + " of " + pendingScan.total.toLocaleString("en-US")
     : addrs.length.toLocaleString("en-US");
   $("#picked").textContent = "";
-  if (pendingScan.cols === 1 && addrs[0]) showBalance(addrs[0]);   // pen 1 -> auto-check
+  if (pendingScan.cols === 1 && addrs[0]) showBalance(addrs[0], pendingScan.k0);   // pen 1 -> auto-check, k0 is this cell's private key
   else resetBalCard();
 };
 

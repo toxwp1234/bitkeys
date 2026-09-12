@@ -75,7 +75,11 @@
     .balcard .bal-state{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);margin-bottom:7px}
     .balcard .bal-btc{font-family:var(--mono);font-size:26px;font-weight:500;color:var(--text);line-height:1.1}
     .balcard .bal-usd{font-family:var(--mono);font-size:13px;color:var(--muted);margin-top:3px}
-    .balcard .bal-addr{font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:9px;word-break:break-all}
+    .balcard .bal-cap{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-top:9px}
+    .balcard .bal-field{margin-top:0}
+    .balcard .bal-field .bal-cap{margin-bottom:2px}
+    .balcard .bal-addr{font-family:var(--mono);font-size:10px;color:var(--text);word-break:break-all}
+    .balcard #balKey{color:#e0b155}
     .balcard a{color:var(--accent);text-decoration:none;margin-top:8px}
     .balcard.checking{animation:balpulse 1s ease-in-out infinite}
     .balcard.checking .bal-state{color:var(--accent)}
@@ -143,10 +147,18 @@
     <aside>
       <div id="balanceCard" class="balcard idle">
         <div class="bal-state" id="balState">click a wallet to check its live balance</div>
+        <div class="bal-cap" id="balGotCap" style="display:none">you got from this click</div>
         <div class="bal-btc" id="balBtc">— BTC</div>
         <div class="bal-usd" id="balUsd"></div>
         <a id="balLink" href="#" target="_blank" rel="noopener" style="display:none;font-size:11px">verify on blockstream.info ↗</a>
-        <div class="bal-addr" id="balAddr"></div>
+        <div class="bal-field" id="balAddrField" style="display:none">
+          <div class="bal-cap">public address</div>
+          <div class="bal-addr" id="balAddr"></div>
+        </div>
+        <div class="bal-field" id="balKeyField" style="display:none">
+          <div class="bal-cap">private key (this cell's number)</div>
+          <div class="bal-addr" id="balKey"></div>
+        </div>
       </div>
       <div class="metrics">
         <div class="metric"><div class="k">keys scanned</div><div class="v" id="mScanned">0</div></div>
