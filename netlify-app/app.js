@@ -239,6 +239,9 @@ function setBalCard(state, addr, sat, priv) {
   $("#balBtc").textContent = btc.toFixed(8) + " BTC";
   $("#balUsd").textContent = btcPrice ? "≈ $" + (btc * btcPrice).toLocaleString("en-US", { maximumFractionDigits: 2 }) : "";
   $("#balState").textContent = state === "funded" ? "★ funded wallet" : "empty wallet";
+  // dopamine feedback: anticipation delay + reveal pulse + tone, scaled by balance.
+  // Only on a real resolved balance (funded/empty) — limit/error leave sat undefined.
+  if (window.dopamine && Number.isFinite(sat)) window.dopamine.reveal($("#balBtc"), sat);
 }
 function resetBalCard() {
   balToken++; $("#balanceCard").className = "balcard idle";
