@@ -1,0 +1,45 @@
+{
+  "file": "wallets_1e-4.bloom",
+  "total_bytes": 131794573,
+  "size_bits": 1054356422,
+  "num_hashes": 13,
+  "header_bytes": 20,
+  "chunk_bytes": 20971520,
+  "parts": [
+    {
+      "name": "wallets_1e-4.bloom.part000",
+      "bytes": 20971520,
+      "sha256": "54fc47f7ad369ea3"
+    },
+    {
+      "name": "wallets_1e-4.bloom.part001",
+      "bytes": 20971520,
+      "sha256": "0bbd24779e2e71d8"
+    },
+    {
+      "name": "wallets_1e-4.bloom.part002",
+      "bytes": 20971520,
+      "sha256": "3e764c1b75b7a518"
+    },
+    {
+      "name": "wallets_1e-4.bloom.part003",
+      "bytes": 20971520,
+      "sha256": "d56115328d5293cf"
+    },
+    {
+      "name": "wallets_1e-4.bloom.part004",
+      "bytes": 20971520,
+      "sha256": "aad9d265f4f4324a"
+    },
+    {
+      "name": "wallets_1e-4.bloom.part005",
+      "bytes": 20971520,
+      "sha256": "1189d8fc83702875"
+    },
+    {
+      "name": "wallets_1e-4.bloom.part006",
+      "bytes": 5965453,
+      "sha256": "db2fb26f649019a4"
+    }
+  ]
+}
