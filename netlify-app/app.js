@@ -96,11 +96,21 @@ function resize() {
   render();
 }
 
+// Fold the sub-pixel offset into the BigInt cell origin — NON-iteratively, so it stays O(1)
+// no matter how far you zoom out. At deep zoom-out (cellPx < 1) a sub-cell offset is smaller
+// than a pixel and therefore invisible, so we fold it away entirely and keep the offset at 0
+// (the old while-loop would spin billions of times here and hang the tab).
 function normalize() {
-  while (subX >= cellPx) { subX -= cellPx; viewX += 1n; }
-  while (subX < 0) { subX += cellPx; viewX -= 1n; }
-  while (subY >= cellPx) { subY -= cellPx; viewY += 1n; }
-  while (subY < 0) { subY += cellPx; viewY -= 1n; }
+  if (cellPx <= 0) return;
+  if (cellPx >= 1) {                                 // zoomed in / mid — keep exact sub-pixel offset
+    let n = Math.floor(subX / cellPx);
+    if (n) { subX -= n * cellPx; viewX += BigInt(n); }
+    n = Math.floor(subY / cellPx);
+    if (n) { subY -= n * cellPx; viewY += BigInt(n); }
+  } else {                                            // deep zoom-out — sub-cell precision is invisible
+    if (subX) { viewX += BigInt(Math.round(subX / cellPx)); subX = 0; }
+    if (subY) { viewY += BigInt(Math.round(subY / cellPx)); subY = 0; }
+  }
   if (viewX < 0n) { viewX = 0n; subX = 0; }
   if (viewY < 0n) { viewY = 0n; subY = 0; }
   if (viewX > W) viewX = W;
@@ -143,24 +153,23 @@ function draw() {
 
   const w = stage.clientWidth, h = stage.clientHeight;
   tctx.clearRect(0, 0, w, h);
+  // Draw a patch at its TRUE size. When you're zoomed far enough out that it would be
+  // smaller than a pixel it is simply not drawn — at that scale it is genuinely invisible,
+  // which is the honest thing to show (no fake "painted" specks floating in empty space).
+  function drawPatch(p) {
+    const s = p.c * cellPx;
+    if (s < 1) return;
+    const sx = Number(p.x - viewX) * cellPx - subX;
+    const sy = Number(p.y - viewY) * cellPx - subY;
+    if (sx > w || sy > h || sx + s < 0 || sy + s < 0) return;
+    tctx.fillRect(sx, sy, s, s);
+  }
   // territory from past (soft-reset) sessions — desaturated gray, "we've been here"
   tctx.fillStyle = raw ? "#7a7a7a" : "rgba(102,106,116,0.5)";
-  for (const p of grayPatches) {
-    const sx = Number(p.x - viewX) * cellPx - subX;
-    const sy = Number(p.y - viewY) * cellPx - subY;
-    const s = p.c * cellPx;
-    if (sx > w || sy > h || sx + s < 0 || sy + s < 0) continue;
-    tctx.fillRect(sx, sy, s, s);
-  }
+  for (const p of grayPatches) drawPatch(p);
   // current session — bright teal, drawn on top
   tctx.fillStyle = raw ? "#000000" : "#1f6f88";
-  for (const p of patches) {
-    const sx = Number(p.x - viewX) * cellPx - subX;
-    const sy = Number(p.y - viewY) * cellPx - subY;
-    const s = p.c * cellPx;
-    if (sx > w || sy > h || sx + s < 0 || sy + s < 0) continue;
-    tctx.fillRect(sx, sy, s, s);
-  }
+  for (const p of patches) drawPatch(p);
   if (landing) {   // red marker: where you just teleported
     const lx = Number(landing.x - viewX) * cellPx - subX;
     const ly = Number(landing.y - viewY) * cellPx - subY;
@@ -170,6 +179,7 @@ function draw() {
   }
   drawMinimap();
   positionCursor();
+  updateZoomUI();
   scheduleSave();
 }
 
@@ -212,9 +222,11 @@ function positionCursor() {
   const precEl = $("#precisionInfo");
   if (precEl && cellPx > 0) precEl.textContent = "cell: " + (cellPx / 28).toFixed(2) + "×";
 
-  const sx = Number(x - viewX) * cellPx - subX;
-  const sy = Number(y - viewY) * cellPx - subY;
-  const s = penC * cellPx;
+  const raw0 = penC * cellPx;
+  const s = Math.max(raw0, 4);                        // stays a visible pen-marker even at overview zoom
+  const off = (raw0 - s) / 2;
+  const sx = Number(x - viewX) * cellPx - subX + off;
+  const sy = Number(y - viewY) * cellPx - subY + off;
   cursor.style.width = s + "px"; cursor.style.height = s + "px";
   cursor.style.transform = `translate(${sx}px,${sy}px)`;
 }
@@ -226,8 +238,11 @@ const worker = new Worker("derive.worker.js?v=8", { type: "module" });
 const keyAt = (i, scan) => scan.k0 + BigInt(Math.floor(i / scan.cols)) * scan.W + BigInt(i % scan.cols);
 const DISPLAY_CAP = 2048;  // max rows rendered in the list; the stream checks far more than we display
 let scanId = 0, pendingScan = null, scanActive = false, firstAddr = null, scanT0 = 0;
+let scanRevealed = false;   // reveal the scan's result number ONCE, after every potential is checked
+let verifyDone = false;     // fire the box-hide + completion chime exactly once per scan
 
 function scanAt(x, y) {
+  try { dopamine.initAudio(); } catch (e) {}         // unlock the AudioContext within this click gesture
   const key = x + "," + y + "," + penC;
   const k0 = kAt(x, y);
   const kh = $("#kHex");
@@ -248,7 +263,8 @@ function scanAt(x, y) {
   pendingScan = { id, k0, W, cols: penC, total: penC * penC, checkedSoFar: 0 };
   lastScan = { k0, W, cols: penC };
   scanActive = true;
-  balGen++; balBatch = { gen: balGen, total: 0, done: 0, funded: 0, failed: 0 };  // fresh balance session
+  balGen++; balBatch = { gen: balGen, total: 0, done: 0, funded: 0, failed: 0, scan: true };  // fresh balance session
+  scanRevealed = false; verifyDone = false; hideChecking();   // fresh scan: nothing revealed / verified yet
   firstAddr = null;
   lastBalanceProvider = null; lastBalanceTimestamp = null;   // no API provenance until one actually answers
   startScanUI(penC * penC);
@@ -416,7 +432,34 @@ const BAL_INTERVAL = 1000;                          // ms between live calls (<=
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let balQueue = [];                                  // [{addr, priv, gen}]
 let balDraining = false, balNextSlot = 0;
-let balBatch = { gen: -1, total: 0, done: 0, funded: 0, failed: 0 };
+let balBatch = { gen: -1, total: 0, done: 0, funded: 0, failed: 0, scan: false };
+
+// ---- live "checking a potential key" module (between the balance card and the metrics) ----
+// Shows ONLY while a scan's Bloom candidates are being verified: animated dots + the key
+// currently in flight + a "X / Y potential verified" counter that keeps climbing. The wait
+// itself (<=1 API call/s) becomes the feedback, so 40 candidates over ~40s never feel dead.
+function showChecking(key) {
+  const box = $("#checkingBox"); if (box) box.style.display = "block";
+  const k = $("#chkKey");
+  if (k) { k.textContent = key; k.classList.remove("tick"); void k.offsetWidth; k.classList.add("tick"); }
+  updateCheckingCount();
+  const prog = balBatch.total ? balBatch.done / balBatch.total : 0;
+  try { dopamine.tick(prog); } catch (e) {}          // rising "pluck" per key — the satisfying cadence
+}
+function updateCheckingCount() {
+  const d = $("#chkDone"), t = $("#chkTotal"), bar = $("#chkBar");
+  if (d) d.textContent = balBatch.done.toLocaleString("en-US");
+  if (t) t.textContent = balBatch.total.toLocaleString("en-US");
+  if (bar) bar.style.width = (balBatch.total ? Math.min(100, balBatch.done / balBatch.total * 100) : 0) + "%";
+}
+function hideChecking() { const box = $("#checkingBox"); if (box) box.style.display = "none"; }
+// fire the "all potentials verified" finish (hide box + celebratory chime) exactly once per scan
+function finishVerification() {
+  if (verifyDone) return;
+  verifyDone = true;
+  hideChecking();
+  if (balBatch.total > 0) { try { dopamine.chime(); } catch (e) {} }
+}
 
 // The single entry point for every balance check. A row click / pen-1 cell is just a
 // batch of one; a Bloom patch passes all its candidates at once. Returns immediately —
@@ -424,7 +467,8 @@ let balBatch = { gen: -1, total: 0, done: 0, funded: 0, failed: 0 };
 function checkBalances(items) {                     // items: [{addr, priv}]
   const gen = ++balGen;                             // supersede any earlier batch outright
   balQueue = items.map((it) => ({ addr: it.addr, priv: it.priv, i: it.i, gen }));
-  balBatch = { gen, total: items.length, done: 0, funded: 0, failed: 0 };
+  balBatch = { gen, total: items.length, done: 0, funded: 0, failed: 0, scan: false };
+  hideChecking();                                   // a manual click is not a scan — no live checking box
   if (!items.length) { resetBalCard(); return; }
   if (items.length === 1) setBalCard("checking", items[0].addr, null, items[0].priv);
   else renderBatch();                              // instant "checking N…" the moment you click
@@ -449,6 +493,7 @@ async function drainBalance() {
   while (balQueue.length) {
     const job = balQueue.shift();
     if (job.gen !== balGen) continue;              // abandoned patch — skip, no slot spent
+    if (balBatch.scan) showChecking(shortHex(job.priv, 10, 8));   // live: the potential key in flight
     const wait = Math.max(0, balNextSlot - Date.now());
     if (wait) await sleep(wait);
     if (job.gen !== balGen) continue;              // superseded while waiting
@@ -477,14 +522,16 @@ function reportBalance(job, res) {
     return;
   }
   b.done++;
+  if (b.scan) updateCheckingCount();               // climb the "X / Y potential verified" counter live
   if (funded) {                                     // the prize takes the card — and is saved forever
     b.funded++; setBalCard("funded", job.addr, res.sat, job.priv);
     saveCandidateToHistory(job.addr, res.sat, job.priv); updateCandidateShelf();
   } else {
     if (res.status !== "ok") b.failed++;
-    if (b.funded) return;                           // a funded hit already owns the card
-    if (!scanActive && b.done >= b.total) finishBatch(b);   // all candidates verified, none funded
+    // reveal the honest 0 BTC number ONLY once every potential key has actually been checked
+    if (!b.funded && !scanActive && b.done >= b.total && !scanRevealed) { scanRevealed = true; finishBatch(b); }
   }
+  if (b.scan && !scanActive && b.done >= b.total) finishVerification();   // last potential resolved -> box done
 }
 
 worker.onmessage = (e) => {
@@ -576,9 +623,13 @@ function updateScanUI(checked, total, found, bloomOn) {
 }
 function finishScanUI() {
   $("#scanBarWrap").style.display = "none";
-  if (balBatch.funded) return;                          // keep the funded prize on screen
-  if (balBatch.done >= balBatch.total) showBloomEmpty2();   // nothing pending / nothing funded -> 0 BTC reveal
-  else $("#balState").textContent = "verifying " + (balBatch.total - balBatch.done) + " candidate(s)…";
+  if (balBatch.done >= balBatch.total) {                // every potential already resolved by scan-end
+    if (balBatch.scan) finishVerification();            // hide the checking box + chime (once)
+    if (!balBatch.funded && !scanRevealed) { scanRevealed = true; showBloomEmpty2(); }
+  } else if (!balBatch.funded) {                        // potentials still being fetched — DON'T claim 0 BTC yet
+    $("#balState").textContent = "verifying " + (balBatch.total - balBatch.done) + " potential key(s)…";
+    // the honest number reveals in reportBalance the moment the last potential resolves
+  }
 }
 // full card + satisfying 0 BTC reveal for an all-empty patch
 function showBloomEmpty2() {
@@ -615,7 +666,10 @@ function fracExplored() {
 let down = false, moved = false, lx = 0, ly = 0;
 stage.addEventListener("mouseenter", () => { mouse.inside = true; });
 stage.addEventListener("mouseleave", () => { mouse.inside = false; positionCursor(); });
-stage.addEventListener("mousedown", (e) => { down = true; moved = false; lx = e.clientX; ly = e.clientY; });
+stage.addEventListener("mousedown", (e) => {
+  if (e.target.closest("#zoomCtl, #zoomScale")) return;   // clicks on the overlay controls aren't map scans
+  down = true; moved = false; lx = e.clientX; ly = e.clientY;
+});
 window.addEventListener("mouseup", (e) => {
   if (down && !moved) {
     const r = stage.getBoundingClientRect();
@@ -636,17 +690,73 @@ stage.addEventListener("mousemove", (e) => {
     positionCursor();
   }
 });
+// ---------- buttery, cursor-anchored deep-zoom ----------
+// Each notch eases cellPx toward a target instead of snapping, and rapid scrolls stack onto
+// the target — so you can spin the wheel and glide from the whole-space overview down to a
+// single pen-pixel in one smooth, satisfying motion. The cell under the cursor stays pinned.
+let zoomTarget = cellPx, zoomAnchor = null, zoomRAF = 0;
+function zoomStep() {
+  zoomRAF = 0;
+  const d = zoomTarget - cellPx;
+  cellPx += d * 0.3;                                   // ease-out toward the target
+  if (Math.abs(zoomTarget - cellPx) <= Math.max(zoomTarget * 0.01, 1e-40)) cellPx = zoomTarget;  // snap home
+  if (zoomAnchor) {                                    // keep the anchored cell under the cursor
+    viewX = zoomAnchor.ax; subX = zoomAnchor.afx * cellPx - zoomAnchor.mx;
+    viewY = zoomAnchor.ay; subY = zoomAnchor.afy * cellPx - zoomAnchor.my;
+    normalize();
+  }
+  render();
+  if (cellPx !== zoomTarget) zoomRAF = requestAnimationFrame(zoomStep);
+}
+function zoomBy(factor, mx, my) {
+  const fx = (mx + subX) / cellPx, fy = (my + subY) / cellPx;
+  zoomAnchor = {
+    ax: viewX + BigInt(Math.floor(fx)), afx: fx - Math.floor(fx),
+    ay: viewY + BigInt(Math.floor(fy)), afy: fy - Math.floor(fy), mx, my,
+  };
+  const base = zoomRAF ? zoomTarget : cellPx;         // stack rapid scrolls; else start from the real zoom
+  zoomTarget = clampN(base * factor, minCell, maxCell);
+  if (!zoomRAF) zoomRAF = requestAnimationFrame(zoomStep);
+}
+function stopZoom() { if (zoomRAF) { cancelAnimationFrame(zoomRAF); zoomRAF = 0; } zoomAnchor = null; zoomTarget = cellPx; }
+// animate straight to an absolute cell size (used by the max-in / max-out buttons)
+function zoomAbs(target, mx, my) {
+  const fx = (mx + subX) / cellPx, fy = (my + subY) / cellPx;
+  zoomAnchor = {
+    ax: viewX + BigInt(Math.floor(fx)), afx: fx - Math.floor(fx),
+    ay: viewY + BigInt(Math.floor(fy)), afy: fy - Math.floor(fy), mx, my,
+  };
+  zoomTarget = clampN(target, minCell, maxCell);
+  if (!zoomRAF) zoomRAF = requestAnimationFrame(zoomStep);
+}
+// where the +/- buttons zoom toward: the last cursor position on the map (the pen marker)
+function zoomFocus() {
+  return [clampN(mouse.x, 0, stage.clientWidth || 0), clampN(mouse.y, 0, stage.clientHeight || 0)];
+}
+// ---------- zoom scale indicator (how deep are we?) ----------
+const SUP = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "-": "⁻" };
+const sup = (n) => String(n).split("").map((c) => SUP[c] || c).join("");
+function fmtBig(n) {
+  if (n < 1000) return Math.round(n).toLocaleString("en-US");
+  const e = Math.floor(Math.log10(n));
+  return (n / Math.pow(10, e)).toFixed(1) + "×10" + sup(e);
+}
+function updateZoomUI() {
+  const fill = $("#zsFill"); if (!fill) return;                 // indicator not in DOM yet
+  const lgMin = Math.log(minCell), lgMax = Math.log(maxCell);
+  let frac = (Math.log(cellPx) - lgMin) / (lgMax - lgMin);
+  frac = Math.max(0, Math.min(1, frac));
+  fill.style.width = (frac * 100).toFixed(1) + "%";
+  const fac = $("#zsFactor"); if (fac) fac.textContent = Math.round(frac * 100) + "%";
+  const det = $("#zsDetail");
+  if (det) det.textContent = cellPx >= 1
+    ? "1 key = " + (cellPx < 10 ? cellPx.toFixed(1) : Math.round(cellPx)) + " px"
+    : "1 px ≈ " + fmtBig(1 / cellPx) + " keys";
+}
 stage.addEventListener("wheel", (e) => {
   e.preventDefault();
   const r = stage.getBoundingClientRect();
-  const mx = e.clientX - r.left, my = e.clientY - r.top;
-  const fx = (mx + subX) / cellPx, fy = (my + subY) / cellPx;
-  const ax = viewX + BigInt(Math.floor(fx)), afx = fx - Math.floor(fx);
-  const ay = viewY + BigInt(Math.floor(fy)), afy = fy - Math.floor(fy);
-  cellPx = clampN(cellPx * (e.deltaY < 0 ? 1.2 : 1 / 1.2), minCell, maxCell);
-  viewX = ax; subX = afx * cellPx - mx;
-  viewY = ay; subY = afy * cellPx - my;
-  normalize(); render();
+  zoomBy(e.deltaY < 0 ? 1.25 : 1 / 1.25, e.clientX - r.left, e.clientY - r.top);
 }, { passive: false });
 
 // ---------- minimap teleport ----------
@@ -669,7 +779,7 @@ $("#apply").addEventListener("click", () => {
   aX = BigInt(clampN(parseInt($("#ax").value) || 128, 1, 255));
   aY = BigInt(clampN(parseInt($("#ay").value) || 128, 1, 255));
   W = 2n ** aX; H = 2n ** aY;
-  viewX = 0n; viewY = 0n; subX = 0; subY = 0; cellPx = 28;
+  viewX = 0n; viewY = 0n; subX = 0; subY = 0; recomputeMinCell(); cellPx = wholeSpaceCell(); stopZoom();
   patches = []; seen.clear(); grayPatches = []; graySeen.clear(); keysScanned = 0; fillHeatBg();
   $("#mScanned").textContent = "0"; $("#mPatches").textContent = "0"; $("#kFrac").textContent = "0 %";
   $("#addrs").innerHTML = ""; $("#kHex").textContent = "— click the map —";
@@ -684,6 +794,7 @@ function showResetToast(msg) {
 function cancelActiveWork() {                     // drop any in-flight scan + queued balance checks
   scanId++; pendingScan = null; scanActive = false; balGen++;
   worker.postMessage({ type: "cancel" });
+  hideChecking();                                  // tear down the live checking box on cancel/reset
 }
 function handleSoftReset() {
   for (const p of patches) {                      // current territory becomes gray "we've been here"
@@ -720,6 +831,15 @@ $("#clear").addEventListener("click", handleResetClick);
 // one patch fills ~45% of the smaller side — the zoom always adapts to the pen.
 const PATCH_MIN_PX = 2;        // a patch at max zoom-out
 function minCellFor(pen) { return Math.max(0.02, PATCH_MIN_PX / pen); }
+// max zoom-OUT: the cell size at which the WHOLE 2^aX × 2^aY keyspace fits in the viewport.
+// This is what lets the main map replace the minimap — you can pull all the way back to the
+// entire space, then scroll in until a single pen-pixel fills the screen.
+function wholeSpaceCell() {
+  const Vw = stage.clientWidth || 800, Vh = stage.clientHeight || 600;
+  const fit = Math.min(Vw / Number(W), Vh / Number(H));
+  return fit > 0 ? fit : Number.MIN_VALUE;
+}
+function recomputeMinCell() { minCell = Math.min(minCellFor(penC), wholeSpaceCell()); }
 function penFitCell() {
   const md = Math.min(stage.clientWidth, stage.clientHeight) || 600;
   return clampN(md * 0.45 / penC, minCell, maxCell);
@@ -730,8 +850,9 @@ function setPen(v) {
   $("#penRange").value = clampN(penC, 1, 1000);
   $("#penVal").textContent = penC.toLocaleString("en-US");
   $("#penWarn").style.display = penC * penC > 16384 ? "inline" : "none";
-  minCell = minCellFor(penC);
+  recomputeMinCell();          // keep full zoom-out to the whole space available
   cellPx = penFitCell();       // reframe: one patch ~45% of the view
+  stopZoom();                  // cancel any in-flight zoom animation; resync the target
   render();
   positionCursor();
 }
@@ -771,7 +892,7 @@ function rebuildHeat() {
 function loadState() {
   let s;
   try { s = JSON.parse(localStorage.getItem(STORE) || "null"); } catch (e) { s = null; }
-  if (!s) return;
+  if (!s) return false;
   try {
     aX = BigInt(s.aX); aY = BigInt(s.aY); penC = s.penC || 16; cellPx = s.cellPx || 28;
     W = 2n ** aX; H = 2n ** aY;
@@ -789,7 +910,8 @@ function loadState() {
     $("#mScanned").textContent = keysScanned.toLocaleString("en-US");
     $("#mPatches").textContent = patches.length.toLocaleString("en-US");
     $("#kFrac").textContent = fracExplored();
-  } catch (e) { /* corrupt state — start fresh */ }
+    return true;
+  } catch (e) { /* corrupt state — start fresh */ return false; }
 }
 
 // ---------- shareable result card (client-side image, no backend) ----------
@@ -827,6 +949,7 @@ $("#share").addEventListener("click", async () => {
 
 // ---------- go to / teleport + shareable URL position ----------
 function goTo(cx, cy) {
+  stopZoom();
   cx = clampB(cx, 0n, W); cy = clampB(cy, 0n, H);
   const vc = Math.floor(stage.clientWidth / cellPx / 2) || 0;
   const vr = Math.floor(stage.clientHeight / cellPx / 2) || 0;
@@ -930,8 +1053,17 @@ window.addEventListener("keydown", (e) => {
   else if (e.key === "ArrowDown" || e.key === "s") { subY -= cellPx; normalize(); render(); e.preventDefault(); }
   else if (e.key === "ArrowLeft" || e.key === "a") { subX += cellPx; normalize(); render(); e.preventDefault(); }
   else if (e.key === "ArrowRight" || e.key === "d") { subX -= cellPx; normalize(); render(); e.preventDefault(); }
-  else if (e.key === "+" || e.key === "=") { cellPx = clampN(cellPx * 1.15, minCell, maxCell); normalize(); render(); e.preventDefault(); }
-  else if (e.key === "-") { cellPx = clampN(cellPx / 1.15, minCell, maxCell); normalize(); render(); e.preventDefault(); }
+  else if (e.key === "+" || e.key === "=") { zoomBy(1.25, stage.clientWidth / 2, stage.clientHeight / 2); e.preventDefault(); }
+  else if (e.key === "-") { zoomBy(1 / 1.25, stage.clientWidth / 2, stage.clientHeight / 2); e.preventDefault(); }
+});
+
+// ---------- on-screen zoom controls ----------
+$("#zIn").addEventListener("click", () => { const [mx, my] = zoomFocus(); zoomBy(1.5, mx, my); });
+$("#zOut").addEventListener("click", () => { const [mx, my] = zoomFocus(); zoomBy(1 / 1.5, mx, my); });
+$("#zMax").addEventListener("click", () => { const [mx, my] = zoomFocus(); zoomAbs(maxCell, mx, my); });   // deepest zoom-in
+$("#zFit").addEventListener("click", () => {          // whole space, framed cleanly from the origin
+  stopZoom(); viewX = 0n; viewY = 0n; subX = 0; subY = 0;
+  zoomAbs(minCell, 0, 0);
 });
 
 $("#clearShelf").addEventListener("click", () => {
@@ -939,9 +1071,12 @@ $("#clearShelf").addEventListener("click", () => {
   try { candidateDB.transaction(CANDIDATE_STORE, "readwrite").objectStore(CANDIDATE_STORE).clear(); updateCandidateShelf(); } catch (e) {}
 });
 
-window.addEventListener("resize", resize);
-loadState();
-minCell = minCellFor(penC);   // pen-relative max zoom-out, whether restored or default
+window.addEventListener("resize", () => { recomputeMinCell(); resize(); });
+const hadSave = loadState();
+recomputeMinCell();           // allow zooming all the way out to the whole keyspace
+if (!hadSave) {               // first visit: open on the whole-space overview, like the old minimap
+  viewX = 0n; viewY = 0n; subX = 0; subY = 0; cellPx = wholeSpaceCell();
+}
 resize();
 applyURLGoto();
 initCandidateDB().then(() => updateCandidateShelf());   // populate the shelf from prior sessions

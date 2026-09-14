@@ -52,6 +52,20 @@
     #trail{position:absolute;inset:0}
     #cursor{position:absolute;top:0;left:0;border:2px solid var(--accent);background:rgba(247,147,26,.10);pointer-events:none;will-change:transform,width,height}
     .hint{position:absolute;left:14px;bottom:12px;color:var(--muted);font-size:12px;background:rgba(13,15,19,.7);padding:6px 10px;border-radius:8px;backdrop-filter:blur(4px)}
+    /* on-screen zoom controls + scale indicator */
+    #zoomCtl{position:absolute;right:14px;bottom:16px;display:flex;flex-direction:column;gap:6px;z-index:4}
+    #zoomCtl button{width:40px;height:40px;padding:0;font-size:18px;font-weight:600;line-height:1;border-radius:11px;background:rgba(18,22,29,.85);border:1px solid var(--border);color:var(--text);backdrop-filter:blur(6px);display:grid;place-items:center;cursor:pointer;transition:transform .08s ease,background .15s,border-color .15s,box-shadow .15s}
+    #zoomCtl button:hover{background:rgba(247,147,26,.16);border-color:var(--accent);color:var(--accent);box-shadow:0 0 16px -4px var(--accent)}
+    #zoomCtl button:active{transform:scale(.9)}
+    #zoomCtl .zc-sep{height:1px;background:var(--border);margin:3px 5px}
+    #zoomScale{position:absolute;right:14px;top:50px;width:158px;background:rgba(13,15,19,.82);border:1px solid var(--border);border-radius:10px;padding:9px 11px;backdrop-filter:blur(6px);z-index:4;font-family:var(--mono)}
+    #zoomScale .zs-top{display:flex;justify-content:space-between;align-items:baseline}
+    #zoomScale .zs-top span:first-child{font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)}
+    #zoomScale #zsFactor{color:var(--accent);font-weight:600;font-size:13px}
+    #zoomScale .zs-bar{height:6px;border-radius:3px;background:rgba(255,255,255,.08);margin:7px 0 4px;overflow:hidden}
+    #zoomScale #zsFill{height:100%;width:0;background:linear-gradient(90deg,var(--teal),var(--accent));box-shadow:0 0 8px rgba(247,147,26,.6);border-radius:3px;transition:width .18s ease}
+    #zoomScale .zs-ends{display:flex;justify-content:space-between;font-size:7.5px;letter-spacing:.03em;color:var(--muted);text-transform:uppercase}
+    #zoomScale #zsDetail{margin-top:6px;font-size:9px;color:var(--text);text-align:center;opacity:.85}
     #intro{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,12,16,.74);backdrop-filter:blur(3px);z-index:5;padding:20px}
     #intro.hidden{display:none}
     #intro .card{max-width:460px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:24px 26px}
@@ -80,6 +94,29 @@
     .addr-list.scanning .row{animation:scanRow .5s ease both;animation-delay:calc(var(--d) * 0.4ms)}
     @keyframes scanRow{0%{background:rgba(247,147,26,.16)}100%{background:transparent}}
     @keyframes spin{to{transform:rotate(360deg)}}
+    /* live "checking a potential key" module — shows only while candidates are being verified */
+    #checkingBox{display:none;flex:none;position:relative;padding:15px 17px;border-radius:14px;overflow:hidden;
+      background:linear-gradient(160deg,rgba(247,147,26,.12),rgba(31,111,136,.05));
+      border:1px solid rgba(247,147,26,.32);
+      box-shadow:0 8px 30px -14px rgba(247,147,26,.65),inset 0 1px 0 rgba(255,255,255,.04)}
+    #checkingBox::after{content:"";position:absolute;inset:-1px;border-radius:14px;pointer-events:none;
+      background:radial-gradient(130% 90% at 0% 0%,rgba(247,147,26,.16),transparent 55%)}
+    #checkingBox>*{position:relative}
+    .chk-head{display:flex;align-items:center;gap:8px;font-size:9.5px;text-transform:uppercase;letter-spacing:.15em;color:var(--muted);margin-bottom:12px}
+    .chk-live{width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 0 rgba(247,147,26,.6);animation:chkPing 1.5s ease-out infinite}
+    @keyframes chkPing{0%{box-shadow:0 0 0 0 rgba(247,147,26,.5)}70%,100%{box-shadow:0 0 0 10px rgba(247,147,26,0)}}
+    .chk-key{font-family:var(--mono);font-size:16px;font-weight:500;letter-spacing:.02em;word-break:break-all;line-height:1.45;
+      background:linear-gradient(90deg,#c9720d 0%,#ffe0ad 32%,#f7931a 55%,#c9720d 82%);background-size:230% 100%;
+      -webkit-background-clip:text;background-clip:text;color:transparent;-webkit-text-fill-color:transparent;
+      animation:chkShimmer 2.6s linear infinite}
+    @keyframes chkShimmer{to{background-position:-230% 0}}
+    .chk-key.tick{animation:chkShimmer 2.6s linear infinite,chkPop .32s cubic-bezier(.34,1.56,.64,1)}
+    @keyframes chkPop{0%{transform:translateY(4px) scale(.985);opacity:.25}100%{transform:translateY(0) scale(1);opacity:1}}
+    .chk-progress{height:5px;border-radius:3px;background:rgba(255,255,255,.07);margin-top:14px;overflow:hidden}
+    .chk-progress-fill{height:100%;width:0;border-radius:3px;background:linear-gradient(90deg,var(--accent),#ffd492);
+      box-shadow:0 0 10px rgba(247,147,26,.8);transition:width .4s cubic-bezier(.22,1,.36,1)}
+    .chk-sub{font-size:10px;color:var(--muted);margin-top:9px;letter-spacing:.03em}
+    .chk-sub b{color:var(--accent);font-weight:600;font-family:var(--mono)}
     #candidateShelf{position:fixed;bottom:0;left:0;right:0;max-height:180px;background:linear-gradient(to top,var(--panel2),var(--panel));border-top:1px solid var(--border);z-index:10;display:none;overflow-y:auto}
     #candidateShelf.show{display:block}
     #candidateShelf .shelf-header{padding:10px 16px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--border)}
@@ -164,9 +201,21 @@
       <div id="grid"></div>
       <canvas id="trail"></canvas>
       <div id="cursor"></div>
-      <div class="hint">click = scan patch · drag = pan · scroll = zoom · minimap = teleport</div>
+      <div class="hint">click = scan patch · drag = pan · scroll / buttons = zoom</div>
       <div id="fpsCounter" style="position:absolute;right:14px;top:14px;font-size:11px;font-family:var(--mono);color:var(--accent);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px);min-width:60px;text-align:right">60 fps</div>
-      <div id="precisionInfo" style="position:absolute;right:14px;top:50px;font-size:9px;font-family:var(--mono);color:var(--muted);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px)">cell: 0.000×</div>
+      <div id="precisionInfo" style="display:none;position:absolute;right:14px;top:50px;font-size:9px;font-family:var(--mono);color:var(--muted);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px)">cell: 0.000×</div>
+      <div id="zoomScale">
+        <div class="zs-top"><span>zoom</span><span id="zsFactor">—</span></div>
+        <div class="zs-bar"><div id="zsFill"></div></div>
+        <div class="zs-ends"><span>whole space</span><span>1 key</span></div>
+        <div id="zsDetail">—</div>
+      </div>
+      <div id="zoomCtl">
+        <button id="zMax" title="max zoom in — down to one key">⊕</button>
+        <button id="zIn" title="zoom in">+</button>
+        <button id="zOut" title="zoom out">−</button>
+        <button id="zFit" title="max zoom out — the whole keyspace">⊗</button>
+      </div>
       <div id="intro"><div class="card">
         <h2>What is this?</h2>
         <p><b>Every square is one private key — one possible Bitcoin wallet.</b></p>
@@ -207,15 +256,21 @@
         </div>
         <button class="ghost" id="expandPatch" style="display:none;width:100%;margin-top:10px;font-size:11px">▾ wallets in patch</button>
       </div>
+      <div id="checkingBox">
+        <div class="chk-head"><span class="chk-live"></span> scanning potential key</div>
+        <div class="chk-key" id="chkKey">—</div>
+        <div class="chk-progress"><div class="chk-progress-fill" id="chkBar"></div></div>
+        <div class="chk-sub"><b id="chkDone">0</b> of <b id="chkTotal">0</b> potential ★ verified</div>
+      </div>
       <div class="metrics">
         <div class="metric"><div class="k">keys scanned</div><div class="v" id="mScanned">0</div></div>
         <div class="metric"><div class="k">patches</div><div class="v" id="mPatches">0</div></div>
       </div>
       <div class="kv"><div class="k">last patch · key (hex)</div><div class="v" id="kHex">— click the map —</div></div>
       <div class="kv"><div class="k">explored of 2²⁵⁶</div><div class="v" id="kFrac">0 %</div></div>
-      <div class="kv" style="padding:10px"><div class="k" style="margin-bottom:8px">minimap · click to teleport</div>
-        <canvas id="minimap" width="288" height="288"></canvas>
-        <div class="k" style="margin-top:8px">location · cursor cell</div>
+      <div class="kv" style="padding:10px">
+        <canvas id="minimap" width="288" height="288" style="display:none"></canvas>
+        <div class="k" style="margin-bottom:8px">location · cursor cell · scroll to zoom</div>
         <div class="v" id="loc" style="font-size:11px">x — · y —</div></div>
       <div class="kv">
         <div class="k" style="display:flex;justify-content:space-between;align-items:center">go to

@@ -44,8 +44,47 @@ export const dopamine = (() => {
 
   function playFeedback(sats) {
     const { freq, entropy, tier } = getValueTier(sats);
-    const harmonics = Math.min(3, Math.floor(entropy * 4));
+    const harmonics = Math.max(1, Math.min(3, Math.floor(entropy * 4)));   // empty (0) still resolves with a soft tone
     harmonic(freq, harmonics);
+  }
+
+  // short rising "pluck" for each potential key as it's checked — pitch climbs with progress
+  // so a batch of candidates plays as a satisfying ascending run instead of dead silence.
+  function tick(progress) {
+    const ctx = initAudio();
+    if (ctx.state !== "running") return;
+    const p = Math.max(0, Math.min(1, progress || 0));
+    const now = ctx.currentTime;
+    const base = 360 + p * 560;                 // 360Hz -> ~920Hz across the batch
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(base, now);
+    osc.frequency.exponentialRampToValueAtTime(base * 1.5, now + 0.09);   // tiny upward chirp
+    osc.connect(gain); gain.connect(ctx.destination);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.05, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.13);
+    osc.start(now); osc.stop(now + 0.14);
+  }
+
+  // ascending major arpeggio when a whole batch of candidates finishes verifying — the "done!" hit
+  function chime() {
+    const ctx = initAudio();
+    if (ctx.state !== "running") return;
+    const now = ctx.currentTime;
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => {   // C5 E5 G5 C6
+      const t = now + i * 0.085;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = f;
+      osc.connect(gain); gain.connect(ctx.destination);
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.exponentialRampToValueAtTime(0.075, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+      osc.start(t); osc.stop(t + 0.3);
+    });
   }
 
   function reveal(element, sats) {
@@ -76,5 +115,5 @@ export const dopamine = (() => {
     });
   }
 
-  return { reveal, getValueTier, playFeedback, initAudio };
+  return { reveal, getValueTier, playFeedback, initAudio, tick, chime };
 })();
