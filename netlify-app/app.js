@@ -1,6 +1,46 @@
 "use strict";
+import { dopamine } from "./dopamine.js?v=2";
 const $ = (s) => document.querySelector(s);
 const stage = $("#stage");
+
+// ---------- candidate history (IndexedDB): funded finds persist across scans & sessions ----------
+const CANDIDATE_DB = "cuvre-candidates";
+const CANDIDATE_STORE = "found";
+let candidateDB = null;
+function initCandidateDB() {
+  return new Promise((resolve) => {
+    try {
+      const r = indexedDB.open(CANDIDATE_DB, 1);
+      r.onupgradeneeded = () => {
+        const db = r.result;
+        if (!db.objectStoreNames.contains(CANDIDATE_STORE)) {
+          const store = db.createObjectStore(CANDIDATE_STORE, { keyPath: "id", autoIncrement: true });
+          store.createIndex("timestamp", "timestamp", { unique: false });
+        }
+      };
+      r.onsuccess = () => { candidateDB = r.result; resolve(); };
+      r.onerror = () => resolve();
+    } catch (e) { resolve(); }
+  });
+}
+function saveCandidateToHistory(addr, sats, priv) {
+  if (!candidateDB) return;
+  try {
+    candidateDB.transaction(CANDIDATE_STORE, "readwrite").objectStore(CANDIDATE_STORE)
+      .add({ addr, sats, priv: priv.toString(16).padStart(64, "0"), timestamp: Date.now() });
+  } catch (e) {}
+}
+function getCandidateHistory(limit = 10) {
+  if (!candidateDB) return Promise.resolve([]);
+  return new Promise((resolve) => {
+    try {
+      const req = candidateDB.transaction(CANDIDATE_STORE, "readonly").objectStore(CANDIDATE_STORE).index("timestamp").getAll();
+      req.onsuccess = () => resolve((req.result || []).reverse().slice(0, limit));
+      req.onerror = () => resolve([]);
+    } catch (e) { resolve([]); }
+  });
+}
+
 const grid = $("#grid");
 const trail = $("#trail");
 const tctx = trail.getContext("2d");
@@ -22,8 +62,11 @@ let lastScan = null;
 let landing = null;   // last teleport target, drawn as a red marker
 let viewX = 0n, viewY = 0n, subX = 0, subY = 0;
 let penC = 16;
-let patches = [];                 // {x,y,c} solid scanned squares
+let patches = [];                 // {x,y,c} solid scanned squares (current session, teal)
 let seen = new Set();             // dedup "x,y,c"
+let grayPatches = [];             // territory carried over from soft resets (drawn gray)
+let graySeen = new Set();
+let lastResetTime = 0, resetPending = false;   // 1× soft / 2× (<500ms) hard reset
 let heatImg = mmctx.createImageData(MM, MM);
 let keysScanned = 0;
 let mouse = { x: 40, y: 40, inside: false };
@@ -66,14 +109,50 @@ function normalize() {
 
 // ---------- rendering ----------
 let pending = false;
-function render() { if (pending) return; pending = true; requestAnimationFrame(() => { pending = false; draw(); }); }
+let frameCount = 0, lastFpsUpdate = 0, currentFps = 60;
+function updateFps(now) {
+  if (now - lastFpsUpdate >= 1000) {
+    currentFps = frameCount;
+    frameCount = 0;
+    lastFpsUpdate = now;
+    const fpsEl = $("#fpsCounter");
+    if (fpsEl) {
+      const color = currentFps >= 50 ? "var(--accent)" : currentFps >= 30 ? "#e0b155" : "#f0616d";
+      fpsEl.style.color = color;
+      fpsEl.textContent = currentFps + " fps";
+    }
+  }
+}
+function render() { if (pending) return; pending = true; requestAnimationFrame((now) => {
+  frameCount++;
+  updateFps(now);
+  pending = false;
+  draw();
+}); }
 
 function draw() {
-  grid.style.backgroundSize = cellPx + "px " + cellPx + "px";
-  grid.style.backgroundPosition = (-subX) + "px " + (-subY) + "px";
+  // adaptive grid: one line per cell when zoomed in; snaps to whole patches (then groups
+  // of patches) as cells shrink, so at max zoom-out the grid reads as patch boundaries.
+  let gs = cellPx, cpl = 1;
+  if (gs < 9) { cpl = penC; gs = cpl * cellPx; while (gs < 9) { cpl *= 2; gs *= 2; } }
+  const cplB = BigInt(Math.max(1, Math.round(cpl)));
+  const phX = (Number(viewX % cplB) * cellPx + subX) % gs;
+  const phY = (Number(viewY % cplB) * cellPx + subY) % gs;
+  grid.style.backgroundSize = gs + "px " + gs + "px";
+  grid.style.backgroundPosition = (-phX) + "px " + (-phY) + "px";
 
   const w = stage.clientWidth, h = stage.clientHeight;
   tctx.clearRect(0, 0, w, h);
+  // territory from past (soft-reset) sessions — desaturated gray, "we've been here"
+  tctx.fillStyle = raw ? "#7a7a7a" : "rgba(102,106,116,0.5)";
+  for (const p of grayPatches) {
+    const sx = Number(p.x - viewX) * cellPx - subX;
+    const sy = Number(p.y - viewY) * cellPx - subY;
+    const s = p.c * cellPx;
+    if (sx > w || sy > h || sx + s < 0 || sy + s < 0) continue;
+    tctx.fillRect(sx, sy, s, s);
+  }
+  // current session — bright teal, drawn on top
   tctx.fillStyle = raw ? "#000000" : "#1f6f88";
   for (const p of patches) {
     const sx = Number(p.x - viewX) * cellPx - subX;
@@ -102,6 +181,12 @@ function drawMinimap() {
   const rh = Math.max(3, Number((BigInt(Math.ceil(vh)) * MMb) / H));
   mmctx.strokeStyle = "#f7931a"; mmctx.lineWidth = 1.5;
   mmctx.strokeRect(rx + 0.5, ry + 0.5, Math.min(rw, MM), Math.min(rh, MM));
+  // static centre crosshair (drawn on the canvas — ::after doesn't render on <canvas>)
+  mmctx.globalAlpha = 0.4; mmctx.strokeStyle = "#f7931a"; mmctx.lineWidth = 1;
+  mmctx.beginPath();
+  mmctx.moveTo(MM / 2, 0); mmctx.lineTo(MM / 2, MM);
+  mmctx.moveTo(0, MM / 2); mmctx.lineTo(MM, MM / 2);
+  mmctx.stroke(); mmctx.globalAlpha = 1;
 }
 
 function cellUnder(mx, my) {
@@ -123,6 +208,10 @@ function positionCursor() {
     `X ${pctOf(x, W)} <span style="color:var(--muted)">${shortHex(x, 5, 4)}</span><br>` +
     `Y ${pctOf(y, H)} <span style="color:var(--muted)">${shortHex(y, 5, 4)}</span>`;
   loc.title = "x 0x" + x.toString(16) + "\ny 0x" + y.toString(16);
+
+  const precEl = $("#precisionInfo");
+  if (precEl && cellPx > 0) precEl.textContent = "cell: " + (cellPx / 28).toFixed(2) + "×";
+
   const sx = Number(x - viewX) * cellPx - subX;
   const sy = Number(y - viewY) * cellPx - subY;
   const s = penC * cellPx;
@@ -131,9 +220,12 @@ function positionCursor() {
 }
 
 // ---------- scanning (client-side, on click only) ----------
-const worker = new Worker("derive.worker.js?v=5", { type: "module" });
-const DERIVE_CAP = 2048;   // max wallets derived+shown per patch (keeps huge pens snappy)
-let scanId = 0, pendingScan = null;
+const worker = new Worker("derive.worker.js?v=8", { type: "module" });
+// One row-major mapping index -> private key, shared by the patch click handler and the
+// Bloom candidate path, so a "funded" address can never be paired with the wrong key.
+const keyAt = (i, scan) => scan.k0 + BigInt(Math.floor(i / scan.cols)) * scan.W + BigInt(i % scan.cols);
+const DISPLAY_CAP = 2048;  // max rows rendered in the list; the stream checks far more than we display
+let scanId = 0, pendingScan = null, scanActive = false, firstAddr = null, scanT0 = 0;
 
 function scanAt(x, y) {
   const key = x + "," + y + "," + penC;
@@ -141,23 +233,26 @@ function scanAt(x, y) {
   const kh = $("#kHex");
   kh.textContent = shortHex(k0, 8, 8);
   kh.title = "0x" + k0.toString(16);
-  // optimistic: paint the patch + counters instantly, whatever the pen size
+  // paint the patch instantly (optimistic); keysScanned now ticks up as the stream checks
   if (!seen.has(key)) {
     seen.add(key);
     patches.push({ x, y, c: penC });
-    keysScanned += penC * penC;
     const mi = (toMMy(y) * MM + toMMx(x)) * 4;
     if (mi >= 0 && mi < heatImg.data.length) { heatImg.data[mi] = 31; heatImg.data[mi + 1] = 111; heatImg.data[mi + 2] = 136; }
   }
-  $("#mScanned").textContent = keysScanned.toLocaleString("en-US");
   $("#mPatches").textContent = patches.length.toLocaleString("en-US");
-  $("#kFrac").textContent = fracExplored();
   render();
-  // derive the actual patch cells (1:1): pen n -> n*n wallets, capped for huge pens
-  const rowsToDerive = Math.min(penC, Math.max(1, Math.floor(DERIVE_CAP / penC)));
+  // stream the WHOLE patch: pen n -> n*n keys, derived + bloom-checked in chunks, off-thread.
+  // No cap — the machine goes as far/fast as it can; a new click cancels the running scan.
   const id = ++scanId;
-  pendingScan = { id, k0, W, cols: penC, total: penC * penC };
-  worker.postMessage({ id, k0: k0.toString(), stride: W.toString(), cols: penC, rows: rowsToDerive });
+  pendingScan = { id, k0, W, cols: penC, total: penC * penC, checkedSoFar: 0 };
+  lastScan = { k0, W, cols: penC };
+  scanActive = true;
+  balGen++; balBatch = { gen: balGen, total: 0, done: 0, funded: 0, failed: 0 };  // fresh balance session
+  firstAddr = null;
+  lastBalanceProvider = null; lastBalanceTimestamp = null;   // no API provenance until one actually answers
+  startScanUI(penC * penC);
+  worker.postMessage({ type: "scan", id, k0: k0.toString(), stride: W.toString(), cols: penC, rows: penC });
 }
 
 // live balance for a single address (only when pen == 1). No single free explorer
@@ -209,7 +304,11 @@ async function liveBalance(addr) {
     active.forEach(async (p) => {
       const r = await tryProvider(p, addr);
       if (settled) return;
-      if (r.status === "ok") { settled = true; return resolve(r); }   // first good answer wins
+      if (r.status === "ok") {                          // first good answer wins
+        settled = true;
+        lastBalanceProvider = p.name; lastBalanceTimestamp = Date.now();
+        return resolve(r);
+      }
       if (r.status === "ratelimited") { p.cooldownUntil = Date.now() + 60000; sawRateLimit = true; }
       if (--pending === 0) resolve({ status: sawRateLimit ? "ratelimited" : "error" });
     });
@@ -221,9 +320,18 @@ fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot")
   .then((r) => r.json())
   .then((d) => { btcPrice = parseFloat(d && d.data && d.data.amount) || 0; })
   .catch(() => {});
-let balToken = 0;
+let balGen = 0;   // bump to supersede any in-flight / queued balance check
+let lastBalanceProvider = null, lastBalanceTimestamp = null;
 // a private key is a 256-bit scalar -> Bitcoin shows it as 64 hex chars (zero-padded)
 const privHex = (priv) => priv == null ? "" : "0x" + priv.toString(16).padStart(64, "0");
+
+// illustrative "computational cost" flavor text for a checked address (not a real figure)
+function calcEntropy(sats) {
+  if (sats === 0) return { bits: 0, cost: 0, desc: "empty" };
+  const bits = Math.log2(sats) + 256;
+  const cost = bits * 0.000000001 * 0.12;
+  return { bits: bits.toFixed(1), cost: cost.toFixed(2), desc: "checked" };
+}
 function setBalCard(state, addr, sat, priv) {
   const card = $("#balanceCard"); card.className = "balcard " + state;
   const addrField = $("#balAddrField"), keyField = $("#balKeyField"), gotCap = $("#balGotCap");
@@ -244,53 +352,259 @@ function setBalCard(state, addr, sat, priv) {
   $("#balBtc").textContent = btc.toFixed(8) + " BTC";
   $("#balUsd").textContent = btcPrice ? "≈ $" + (btc * btcPrice).toLocaleString("en-US", { maximumFractionDigits: 2 }) : "";
   $("#balState").textContent = state === "funded" ? "★ funded wallet" : "empty wallet";
-  // dopamine feedback: anticipation delay + reveal pulse + tone, scaled by balance.
-  // Only on a real resolved balance (funded/empty) — limit/error leave sat undefined.
-  if (window.dopamine && Number.isFinite(sat)) window.dopamine.reveal($("#balBtc"), sat);
+
+  // provenance strip: only when a live API actually answered (never for a bloom-only empty)
+  const metaEl = $("#balMeta");
+  if (Number.isFinite(sat) && lastBalanceProvider) {
+    metaEl.style.display = "block";
+    if (lastBalanceProvider) $("#balSourceName").textContent = lastBalanceProvider;
+    if (lastBalanceTimestamp) $("#balTimestamp").textContent = new Date(lastBalanceTimestamp).toLocaleTimeString() + " UTC";
+    const entropyDiv = $("#entropyDisplay");
+    if (sat === 0) { entropyDiv.style.display = "none"; }
+    else {
+      const ent = calcEntropy(sat);
+      entropyDiv.innerHTML = `<div class="entropy-meter">
+        <div class="label">computational cost to verify</div>
+        <div class="stat"><span>~${ent.bits} bits entropy</span><span class="value">$${ent.cost} USD equiv</span></div>
+      </div>`;
+      entropyDiv.style.display = "block";
+    }
+  } else {
+    metaEl.style.display = "none";
+    $("#entropyDisplay").style.display = "none";
+  }
+
+  // dopamine feedback: reveal pulse + tone, scaled by balance (only on a resolved balance)
+  if (Number.isFinite(sat)) dopamine.reveal($("#balBtc"), sat);
 }
 function resetBalCard() {
-  balToken++; $("#balanceCard").className = "balcard idle";
+  balGen++; $("#balanceCard").className = "balcard idle";
   $("#balState").textContent = "click a wallet to check its live balance";
   $("#balGotCap").style.display = "none";
   $("#balBtc").textContent = "— BTC"; $("#balUsd").textContent = "";
   $("#balAddr").textContent = ""; $("#balAddrField").style.display = "none";
   $("#balKey").textContent = ""; $("#balKeyField").style.display = "none";
   $("#balLink").style.display = "none";
+  $("#balMeta").style.display = "none"; $("#entropyDisplay").style.display = "none";
 }
-// client-side rate limiter: keep live calls to <= 1/s so we never burn a provider's quota
-let nextSlot = 0;                                   // earliest timestamp we may fire the next call
+
+// bottom shelf: the most recent funded finds, persistent across scans/clicks/sessions
+async function updateCandidateShelf() {
+  const history = await getCandidateHistory(10);
+  const shelfItems = $("#shelfItems");
+  shelfItems.innerHTML = "";
+  if (!history.length) { $("#candidateShelf").classList.remove("show"); return; }
+  history.forEach((c) => {
+    const timeStr = new Date(c.timestamp).toLocaleTimeString();
+    const satsDisplay = c.sats > 0 ? `<span class="sat">+${(c.sats / 1e8).toFixed(8)} BTC</span>` : "";
+    const chip = document.createElement("div");
+    chip.className = "candidate-chip";
+    chip.innerHTML = `${c.addr.slice(0, 12)}…<span class="time">${timeStr}</span>${satsDisplay}`;
+    chip.addEventListener("click", () => { try { showBalance(c.addr, BigInt("0x" + c.priv)); } catch (e) {} });
+    shelfItems.appendChild(chip);
+  });
+  $("#candidateCount").textContent = history.length;
+  $("#candidateShelf").classList.add("show");
+}
+// ---------- rate-limited balance-check QUEUE ----------
+// The Bloom filter flags candidate wallets; each is confirmed via the live API, but
+// explorers rate-limit, so we DRAIN the queue at <= 1 call/s. A patch that yields 4
+// candidates spreads over ~4s instead of firing 4 calls at once (no rate-limit error).
+// Every new scan/click bumps `balGen`, so pending checks from an abandoned patch are
+// dropped BEFORE they spend a slot — the queue can never pile up across clicks.
+const BAL_INTERVAL = 1000;                          // ms between live calls (<= 1/s)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function showBalance(addr, priv) {
-  const token = ++balToken;
-  setBalCard("checking", addr, null, priv);
-  const wait = Math.max(0, nextSlot - Date.now());
-  if (wait) await sleep(wait);
-  if (token !== balToken) return;                   // a faster click superseded us while waiting — don't spend a slot
-  nextSlot = Math.max(Date.now(), nextSlot) + 1000; // reserve this call's 1s slot
-  const res = await liveBalance(addr);
-  if (token !== balToken) return;                   // superseded during the request
-  const state = res.status === "ok" ? (res.sat > 0 ? "funded" : "empty")
-              : res.status === "ratelimited" ? "limit"
-              : "error";
-  setBalCard(state, addr, res.sat, priv);
+let balQueue = [];                                  // [{addr, priv, gen}]
+let balDraining = false, balNextSlot = 0;
+let balBatch = { gen: -1, total: 0, done: 0, funded: 0, failed: 0 };
+
+// The single entry point for every balance check. A row click / pen-1 cell is just a
+// batch of one; a Bloom patch passes all its candidates at once. Returns immediately —
+// results trickle in as slots free up, so the click itself always feels instant.
+function checkBalances(items) {                     // items: [{addr, priv}]
+  const gen = ++balGen;                             // supersede any earlier batch outright
+  balQueue = items.map((it) => ({ addr: it.addr, priv: it.priv, i: it.i, gen }));
+  balBatch = { gen, total: items.length, done: 0, funded: 0, failed: 0 };
+  if (!items.length) { resetBalCard(); return; }
+  if (items.length === 1) setBalCard("checking", items[0].addr, null, items[0].priv);
+  else renderBatch();                              // instant "checking N…" the moment you click
+  if (!balDraining) drainBalance();
+}
+function showBalance(addr, priv) { checkBalances([{ addr, priv }]); }   // single wallet
+
+function renderBatch() {
+  const b = balBatch;
+  $("#balanceCard").className = "balcard checking";
+  $("#balGotCap").style.display = "none";
+  $("#balAddrField").style.display = "none"; $("#balKeyField").style.display = "none";
+  $("#balLink").style.display = "none";
+  $("#balBtc").textContent = b.done + "/" + b.total; $("#balUsd").textContent = "";
+  $("#balState").textContent = "checking candidate wallets…" + (b.funded ? " · " + b.funded + " funded ★" : "");
+}
+function finishBatch(b) {
+  showBloomEmpty2();                                   // full card + satisfying 0 BTC reveal
+}
+async function drainBalance() {
+  balDraining = true;
+  while (balQueue.length) {
+    const job = balQueue.shift();
+    if (job.gen !== balGen) continue;              // abandoned patch — skip, no slot spent
+    const wait = Math.max(0, balNextSlot - Date.now());
+    if (wait) await sleep(wait);
+    if (job.gen !== balGen) continue;              // superseded while waiting
+    balNextSlot = Math.max(Date.now(), balNextSlot) + BAL_INTERVAL;   // reserve this call's 1s slot
+    const res = await liveBalance(job.addr);
+    if (job.gen !== balGen) continue;              // superseded during the request
+    reportBalance(job, res);
+  }
+  balDraining = false;
+}
+// A user only ever sees "funded" when the API confirms sat > 0 — a Bloom false-positive
+// resolves to sat 0 here and is dropped silently, never shown as a hit.
+function setRowState(i, state) {                   // "checking" | "miss" | "hit"
+  const row = $('#addrs .row[data-i="' + i + '"]');
+  if (row) { row.classList.remove("checking", "miss", "hit"); row.classList.add(state); }
+}
+function reportBalance(job, res) {
+  const b = balBatch;
+  const funded = res.status === "ok" && res.sat > 0;
+  if (job.i != null) setRowState(job.i, funded ? "hit" : "miss");
+  if (!scanActive && b.total <= 1) {               // manual single check (row click)
+    const state = res.status === "ok" ? (funded ? "funded" : "empty")
+                : res.status === "ratelimited" ? "limit" : "error";
+    setBalCard(state, job.addr, res.sat, job.priv);
+    if (funded) { saveCandidateToHistory(job.addr, res.sat, job.priv); updateCandidateShelf(); }
+    return;
+  }
+  b.done++;
+  if (funded) {                                     // the prize takes the card — and is saved forever
+    b.funded++; setBalCard("funded", job.addr, res.sat, job.priv);
+    saveCandidateToHistory(job.addr, res.sat, job.priv); updateCandidateShelf();
+  } else {
+    if (res.status !== "ok") b.failed++;
+    if (b.funded) return;                           // a funded hit already owns the card
+    if (!scanActive && b.done >= b.total) finishBatch(b);   // all candidates verified, none funded
+  }
 }
 
 worker.onmessage = (e) => {
-  const { id, addrs } = e.data;
-  if (pendingCalc && id === pendingCalc.id) {
-    $("#calcOut").innerHTML = "0x" + pendingCalc.k.toString(16) + "<br>↳ " + addrs[0];
-    pendingCalc = null; return;
+  const msg = e.data;
+  // ---- Bloom lifecycle ----
+  if (msg.type === "bloomProgress") return;             // silent background load, no UI
+  if (msg.type === "bloomReady") { bloomReady = true; return; }
+  if (msg.type === "bloomError") {                      // transient? retry once, quietly
+    if (!bloomRetried) { bloomRetried = true; setTimeout(() => worker.postMessage({ type: "loadBloom", base: BLOOM_BASE }), 4000); }
+    return;
   }
-  if (!pendingScan || pendingScan.id !== id) return;
-  lastScan = { k0: pendingScan.k0, W: pendingScan.W, cols: pendingScan.cols };
-  $("#addrs").innerHTML = addrs.map((a, i) => `<div class="row" data-i="${i}">${a}</div>`).join("");
-  $("#addrCount").textContent = addrs.length < pendingScan.total
-    ? addrs.length.toLocaleString("en-US") + " of " + pendingScan.total.toLocaleString("en-US")
-    : addrs.length.toLocaleString("en-US");
-  $("#picked").textContent = "";
-  if (pendingScan.cols === 1 && addrs[0]) showBalance(addrs[0], pendingScan.k0);   // pen 1 -> auto-check, k0 is this cell's private key
-  else resetBalCard();
+  if (msg.type === "calcResult") {                      // key -> address modal
+    if (pendingCalc && msg.id === pendingCalc.id) { $("#calcOut").innerHTML = "0x" + pendingCalc.k.toString(16) + "<br>↳ " + msg.addr; pendingCalc = null; }
+    return;
+  }
+
+  // ---- streamed scan ----
+  if (msg.type === "scanProgress") {
+    if (!pendingScan || msg.id !== pendingScan.id) return;
+    tickChecked(msg.checked);
+    if (msg.display) renderPatchList(msg.display, msg.total, msg.bloomOn);
+    updateScanUI(msg.checked, msg.total, msg.foundCount, msg.bloomOn);
+    if (msg.candidates && msg.candidates.length) {      // stream candidates into the throttled API queue
+      msg.candidates.forEach((c) => setRowState(c.i, "checking"));
+      enqueueBalances(msg.candidates.map((c) => ({ addr: c.addr, priv: keyAt(c.i, lastScan), i: c.i })));
+    }
+    return;
+  }
+  if (msg.type === "scanDone") {
+    if (!pendingScan || msg.id !== pendingScan.id) return;
+    tickChecked(msg.checked);
+    if (msg.display) renderPatchList(msg.display, msg.total, msg.bloomOn);
+    scanActive = false;
+    finishScanUI();
+    return;
+  }
 };
+
+// keysScanned ticks up honestly as the stream confirms keys (never the fictional pen²)
+function tickChecked(checked) {
+  const delta = checked - pendingScan.checkedSoFar;
+  if (delta <= 0) return;
+  pendingScan.checkedSoFar = checked;
+  keysScanned += delta;
+  $("#mScanned").textContent = keysScanned.toLocaleString("en-US");
+  $("#kFrac").textContent = fracExplored();
+}
+
+// on-screen sample of the scanned addresses (the stream checks far more than this)
+function renderPatchList(addrs, total, bloomOn) {
+  firstAddr = addrs[0] || null;
+  const shown = Math.min(addrs.length, DISPLAY_CAP);
+  const base = bloomOn ? "miss" : "";                   // ✕ = checked, not found
+  let html = "";
+  for (let i = 0; i < shown; i++)
+    html += `<div class="row ${base}" data-i="${i}" style="--d:${i}"><span class="dot"></span><span class="ra">${addrs[i]}</span></div>`;
+  $("#addrs").innerHTML = html;
+  $("#addrCount").textContent = "showing " + shown.toLocaleString("en-US") + " of " + total.toLocaleString("en-US");
+  $("#picked").textContent = "";
+  $("#expandPatch").style.display = "block";
+  setExpandLabel();
+  if (!$("#patchBox").hidden) runScan();
+}
+
+// ---- the satisfying "waiting" screen: a live progress card while the machine grinds ----
+function startScanUI(total) {
+  scanT0 = performance.now();
+  const card = $("#balanceCard"); card.className = "balcard scanning";
+  $("#balGotCap").style.display = "none"; $("#balAddrField").style.display = "none";
+  $("#balKeyField").style.display = "none"; $("#balLink").style.display = "none";
+  $("#balMeta").style.display = "none"; $("#entropyDisplay").style.display = "none";
+  $("#balState").textContent = "scanning patch…";
+  $("#balBtc").textContent = "0";
+  $("#balUsd").textContent = "of " + total.toLocaleString("en-US") + " wallets";
+  $("#scanBarWrap").style.display = "block"; $("#scanBarFill").style.width = "0%";
+}
+function updateScanUI(checked, total, found, bloomOn) {
+  if (balBatch.funded) return;                          // a real hit owns the card — never cover it
+  const card = $("#balanceCard"); if (!card.classList.contains("scanning")) card.className = "balcard scanning";
+  $("#scanBarWrap").style.display = "block";
+  $("#scanBarFill").style.width = (total ? Math.min(100, checked / total * 100) : 100).toFixed(3) + "%";
+  $("#balBtc").textContent = checked.toLocaleString("en-US");
+  const rate = Math.round(checked / Math.max(0.001, (performance.now() - scanT0) / 1000));
+  if ($("#scanStats")) $("#scanStats").textContent = found ? found.toLocaleString("en-US") + " potential ★" : "—";
+  if ($("#scanRate")) $("#scanRate").textContent = rate.toLocaleString("en-US") + "/s";
+  $("#balState").textContent = bloomOn ? "scanning patch…" : "loading filter…";
+  $("#balUsd").textContent = "of " + total.toLocaleString("en-US") + " · " + rate.toLocaleString("en-US") + "/s"
+    + (found ? " · " + found.toLocaleString("en-US") + " candidate" + (found > 1 ? "s" : "") + " ★" : "");
+}
+function finishScanUI() {
+  $("#scanBarWrap").style.display = "none";
+  if (balBatch.funded) return;                          // keep the funded prize on screen
+  if (balBatch.done >= balBatch.total) showBloomEmpty2();   // nothing pending / nothing funded -> 0 BTC reveal
+  else $("#balState").textContent = "verifying " + (balBatch.total - balBatch.done) + " candidate(s)…";
+}
+// full card + satisfying 0 BTC reveal for an all-empty patch
+function showBloomEmpty2() {
+  setBalCard("empty", firstAddr, 0, firstAddr ? keyAt(0, lastScan) : null);
+}
+// append candidates to the CURRENT scan's balance session (no supersede, unlike checkBalances)
+function enqueueBalances(items) {
+  const gen = balBatch.gen;
+  items.forEach((it) => balQueue.push({ addr: it.addr, priv: it.priv, i: it.i, gen }));
+  balBatch.total += items.length;
+  if (!balDraining) drainBalance();
+}
+// expandable patch list (collapsed by default) + live-scan sweep across the rows
+function setExpandLabel() {
+  $("#expandPatch").textContent = ($("#patchBox").hidden ? "▾ " : "▴ ") + "wallets in patch (" + $("#addrCount").textContent + ")";
+}
+function runScan() {                                   // restart the CSS stagger animation
+  const list = $("#addrs");
+  list.classList.remove("scanning"); void list.offsetWidth; list.classList.add("scanning");
+}
+$("#expandPatch").addEventListener("click", () => {
+  const box = $("#patchBox");
+  box.hidden = !box.hidden;
+  setExpandLabel();
+  if (!box.hidden) runScan();
+});
 
 function fracExplored() {
   const pct = Number(BigInt(keysScanned) * 10n ** 40n / TWO256) / 1e40 * 100;
@@ -356,30 +670,69 @@ $("#apply").addEventListener("click", () => {
   aY = BigInt(clampN(parseInt($("#ay").value) || 128, 1, 255));
   W = 2n ** aX; H = 2n ** aY;
   viewX = 0n; viewY = 0n; subX = 0; subY = 0; cellPx = 28;
-  patches = []; seen.clear(); keysScanned = 0; fillHeatBg();
+  patches = []; seen.clear(); grayPatches = []; graySeen.clear(); keysScanned = 0; fillHeatBg();
   $("#mScanned").textContent = "0"; $("#mPatches").textContent = "0"; $("#kFrac").textContent = "0 %";
   $("#addrs").innerHTML = ""; $("#kHex").textContent = "— click the map —";
   setPen(parseInt($("#pen").value) || 16);
 });
-$("#clear").addEventListener("click", () => {
-  patches = []; seen.clear(); keysScanned = 0; fillHeatBg();
+// ---------- smart reset: 1× soft (gray tiles + zero the count) · 2× fast (full wipe) ----------
+function showResetToast(msg) {
+  const t = $("#resetToast"); if (!t) return;
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(t._timer); t._timer = setTimeout(() => t.classList.remove("show"), 1700);
+}
+function cancelActiveWork() {                     // drop any in-flight scan + queued balance checks
+  scanId++; pendingScan = null; scanActive = false; balGen++;
+  worker.postMessage({ type: "cancel" });
+}
+function handleSoftReset() {
+  for (const p of patches) {                      // current territory becomes gray "we've been here"
+    const k = p.x + "," + p.y + "," + p.c;
+    if (!graySeen.has(k)) { graySeen.add(k); grayPatches.push(p); }
+  }
+  patches = []; seen.clear(); keysScanned = 0;
+  cancelActiveWork(); resetBalCard();
+  $("#mScanned").textContent = "0"; $("#mPatches").textContent = "0"; $("#kFrac").textContent = fracExplored();
+  render();
+  clearTimeout(saveTimer); saveState();            // persist immediately — don't rely on the rAF-debounced save
+  showResetToast("soft reset — " + grayPatches.length.toLocaleString("en-US") + " patches kept as territory");
+}
+function handleHardReset() {                       // nuclear: nothing survives
+  patches = []; seen.clear(); grayPatches = []; graySeen.clear(); keysScanned = 0;
+  cancelActiveWork(); resetBalCard(); fillHeatBg();
+  if (candidateDB) { try { candidateDB.transaction(CANDIDATE_STORE, "readwrite").objectStore(CANDIDATE_STORE).clear(); } catch (e) {} }
+  updateCandidateShelf();
   $("#mScanned").textContent = "0"; $("#mPatches").textContent = "0"; $("#kFrac").textContent = "0 %";
   render();
-});
-// Zoom auto-adapts to the pen: if the pen would cover most of the view, zoom out
-// so it stays a manageable patch (fixes "pen 100 covers everything").
-function autofitZoom() {
-  const md = Math.min(stage.clientWidth, stage.clientHeight);
-  if (penC * cellPx > md * 0.6) cellPx = clampN(md * 0.45 / penC, minCell, maxCell);
-  render();
+  clearTimeout(saveTimer); saveState();            // persist immediately — don't rely on the rAF-debounced save
+  showResetToast("hard reset — clean slate");
+}
+function handleResetClick() {
+  const now = Date.now();
+  if (resetPending && now - lastResetTime < 500) { resetPending = false; handleHardReset(); return; }
+  resetPending = true; lastResetTime = now;
+  setTimeout(() => { resetPending = false; }, 500);
+  handleSoftReset();
+}
+$("#clear").addEventListener("click", handleResetClick);
+// Zoom is pen-relative. Max zoom-OUT is set so a whole pen×pen patch collapses to ~2px
+// (a "pixel"); max zoom-IN keeps a single cell big. Changing the pen reframes the view so
+// one patch fills ~45% of the smaller side — the zoom always adapts to the pen.
+const PATCH_MIN_PX = 2;        // a patch at max zoom-out
+function minCellFor(pen) { return Math.max(0.02, PATCH_MIN_PX / pen); }
+function penFitCell() {
+  const md = Math.min(stage.clientWidth, stage.clientHeight) || 600;
+  return clampN(md * 0.45 / penC, minCell, maxCell);
 }
 function setPen(v) {
-  penC = clampN(Math.round(v) || 16, 1, 128);
+  penC = clampN(Math.round(v) || 16, 1, 1000000);      // no ceiling but a sane guard; go as big as your machine allows
   $("#pen").value = penC;
-  $("#penRange").value = clampN(penC, 10, 40);
-  $("#penVal").textContent = penC;
-  $("#penWarn").style.display = penC > 48 ? "inline" : "none";
-  autofitZoom();
+  $("#penRange").value = clampN(penC, 1, 1000);
+  $("#penVal").textContent = penC.toLocaleString("en-US");
+  $("#penWarn").style.display = penC * penC > 16384 ? "inline" : "none";
+  minCell = minCellFor(penC);
+  cellPx = penFitCell();       // reframe: one patch ~45% of the view
+  render();
   positionCursor();
 }
 $("#pen").addEventListener("input", (e) => setPen(parseInt(e.target.value)));
@@ -399,12 +752,17 @@ function saveState() {
       viewX: viewX.toString(), viewY: viewY.toString(), subX, subY,
       keysScanned,
       patches: kept.map((p) => [p.x.toString(), p.y.toString(), p.c]),
+      grayPatches: grayPatches.slice(-PATCH_CAP).map((p) => [p.x.toString(), p.y.toString(), p.c]),
     }));
   } catch (e) { /* private mode / quota — ignore */ }
   updateURL();
 }
 function rebuildHeat() {
   fillHeatBg();
+  for (const p of grayPatches) {
+    const mi = (toMMy(p.y) * MM + toMMx(p.x)) * 4;
+    if (mi >= 0 && mi < heatImg.data.length) { heatImg.data[mi] = 90; heatImg.data[mi + 1] = 94; heatImg.data[mi + 2] = 104; }
+  }
   for (const p of patches) {
     const mi = (toMMy(p.y) * MM + toMMx(p.x)) * 4;
     if (mi >= 0 && mi < heatImg.data.length) { heatImg.data[mi] = 31; heatImg.data[mi + 1] = 111; heatImg.data[mi + 2] = 136; }
@@ -422,6 +780,8 @@ function loadState() {
     keysScanned = s.keysScanned || 0;
     patches = (s.patches || []).map(([x, y, c]) => ({ x: BigInt(x), y: BigInt(y), c }));
     for (const p of patches) seen.add(p.x + "," + p.y + "," + p.c);
+    grayPatches = (s.grayPatches || []).map(([x, y, c]) => ({ x: BigInt(x), y: BigInt(y), c }));
+    for (const p of grayPatches) graySeen.add(p.x + "," + p.y + "," + p.c);
     rebuildHeat();
     $("#ax").value = aX.toString(); $("#ay").value = aY.toString();
     $("#pen").value = penC; $("#penRange").value = clampN(penC, 10, 40); $("#penVal").textContent = penC;
@@ -535,17 +895,28 @@ $("#calcGo").addEventListener("click", () => {
   if (k < 1n || k > max) { $("#calcErr").textContent = "Out of range (1 … 2^" + (aX + aY) + ")."; return; }
   $("#calcErr").textContent = ""; $("#calcOut").textContent = "computing…";
   const id = "c" + (++calcId); pendingCalc = { id, k };
-  worker.postMessage({ id, k0: k.toString(), stride: "1", cols: 1, rows: 1 });
+  worker.postMessage({ type: "calc", id, k0: k.toString() });
 });
 $("#addrs").addEventListener("click", (e) => {
   const row = e.target.closest(".row"); if (!row || !lastScan) return;
-  const i = +row.dataset.i, cols = lastScan.cols;      // patch is row-major
-  const key = lastScan.k0 + BigInt(Math.floor(i / cols)) * lastScan.W + BigInt(i % cols);
-  const address = row.textContent;
+  const i = +row.dataset.i;                            // patch is row-major
+  const key = keyAt(i, lastScan);
+  const address = (row.querySelector(".ra") || row).textContent;
   $("#picked").innerHTML = address + " <span style='color:var(--muted)'>· address copied</span><br>↳ 0x" + key.toString(16);
   try { navigator.clipboard.writeText(address); } catch (e) {}
-  showBalance(address);   // clicking any wallet also checks its live balance
+  showBalance(address, key);   // clicking any wallet also checks its live balance
 });
+
+// ---------- Bloom filter: auto-load in the background at startup ----------
+// No UI: the filter downloads once, is cached in IndexedDB (instant on return visits),
+// and is patched into worker memory silently. Until it's ready, scans fall back to the
+// live API path. Local dev serves parts from /bloom/; production from jsDelivr.
+const IS_LOCAL = location.hostname === "127.0.0.1" || location.hostname === "localhost";
+const BLOOM_BASE = IS_LOCAL
+  ? "/bloom/"
+  : "https://cdn.jsdelivr.net/gh/toxwp1234/bitkeys@bloom-v1/bloom/";   // TODO: confirm tag/path at deploy
+let bloomReady = false, bloomRetried = false;
+worker.postMessage({ type: "loadBloom", base: BLOOM_BASE });
 
 // ---------- intro overlay ----------
 function hideIntro() { $("#intro").classList.add("hidden"); try { localStorage.setItem("cuvre-intro-seen", "1"); } catch (e) {} }
@@ -553,7 +924,24 @@ $("#introGo").addEventListener("click", hideIntro);
 $("#about").addEventListener("click", () => $("#intro").classList.remove("hidden"));
 try { if (localStorage.getItem("cuvre-intro-seen") === "1") $("#intro").classList.add("hidden"); } catch (e) {}
 
+window.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (e.key === "ArrowUp" || e.key === "w") { subY += cellPx; normalize(); render(); e.preventDefault(); }
+  else if (e.key === "ArrowDown" || e.key === "s") { subY -= cellPx; normalize(); render(); e.preventDefault(); }
+  else if (e.key === "ArrowLeft" || e.key === "a") { subX += cellPx; normalize(); render(); e.preventDefault(); }
+  else if (e.key === "ArrowRight" || e.key === "d") { subX -= cellPx; normalize(); render(); e.preventDefault(); }
+  else if (e.key === "+" || e.key === "=") { cellPx = clampN(cellPx * 1.15, minCell, maxCell); normalize(); render(); e.preventDefault(); }
+  else if (e.key === "-") { cellPx = clampN(cellPx / 1.15, minCell, maxCell); normalize(); render(); e.preventDefault(); }
+});
+
+$("#clearShelf").addEventListener("click", () => {
+  if (!candidateDB) return;
+  try { candidateDB.transaction(CANDIDATE_STORE, "readwrite").objectStore(CANDIDATE_STORE).clear(); updateCandidateShelf(); } catch (e) {}
+});
+
 window.addEventListener("resize", resize);
 loadState();
+minCell = minCellFor(penC);   // pen-relative max zoom-out, whether restored or default
 resize();
 applyURLGoto();
+initCandidateDB().then(() => updateCandidateShelf());   // populate the shelf from prior sessions

@@ -69,8 +69,25 @@
     .kv .k{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px}
     .kv .v{font-family:var(--mono);font-size:12px;word-break:break-all}
     #minimap{width:100%;aspect-ratio:1;display:block;background:#0a0c10;border-radius:8px;cursor:pointer}
-    .addr-list .row{font-family:var(--mono);font-size:11px;color:var(--muted);padding:3px 0;word-break:break-all;cursor:pointer}
-    .addr-list .row:hover{color:var(--text)}
+    .addr-list .row{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--muted);padding:3px 4px;border-radius:5px;word-break:break-all;cursor:pointer}
+    .addr-list .row .ra{flex:1;min-width:0;word-break:break-all}
+    .addr-list .row .dot{width:12px;height:12px;flex:none;display:grid;place-items:center;font-size:10px;line-height:1}
+    .addr-list .row.miss .dot::before{content:"✕";color:#5a6472}
+    .addr-list .row.hit{color:#3fb950}
+    .addr-list .row.hit .dot::before{content:"✓";color:#3fb950;font-weight:700}
+    .addr-list .row.checking .dot{width:11px;height:11px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;box-sizing:border-box;animation:spin .6s linear infinite}
+    .addr-list .row:hover{color:var(--text);background:var(--panel2)}
+    .addr-list.scanning .row{animation:scanRow .5s ease both;animation-delay:calc(var(--d) * 0.4ms)}
+    @keyframes scanRow{0%{background:rgba(247,147,26,.16)}100%{background:transparent}}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    #candidateShelf{position:fixed;bottom:0;left:0;right:0;max-height:180px;background:linear-gradient(to top,var(--panel2),var(--panel));border-top:1px solid var(--border);z-index:10;display:none;overflow-y:auto}
+    #candidateShelf.show{display:block}
+    #candidateShelf .shelf-header{padding:10px 16px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--border)}
+    #candidateShelf .shelf-items{display:flex;gap:8px;padding:10px 16px;flex-wrap:wrap}
+    .candidate-chip{background:rgba(31,111,136,.3);border:1px solid var(--teal);border-radius:6px;padding:8px 12px;font-size:10px;font-family:var(--mono);color:var(--text);cursor:pointer;transition:all .15s;white-space:nowrap}
+    .candidate-chip:hover{background:rgba(31,111,136,.5);border-color:var(--accent);box-shadow:0 0 12px rgba(247,147,26,.2)}
+    .candidate-chip .sat{color:var(--accent);font-weight:600;margin-left:6px}
+    .candidate-chip .time{display:block;font-size:8px;color:var(--muted);margin-top:3px}
     .balcard{border-radius:12px;padding:16px 16px 14px;border:1px solid var(--border);background:var(--panel);transition:border-color .2s,box-shadow .2s,background .2s}
     .balcard .bal-state{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);margin-bottom:7px}
     .balcard .bal-btc{font-family:var(--mono);font-size:26px;font-weight:500;color:var(--text);line-height:1.1}
@@ -81,8 +98,20 @@
     .balcard .bal-addr{font-family:var(--mono);font-size:10px;color:var(--text);word-break:break-all}
     .balcard #balKey{color:#e0b155}
     .balcard a{color:var(--accent);text-decoration:none;margin-top:8px}
+    .entropy-meter{margin-top:12px;padding:10px;background:rgba(31,111,136,.2);border-radius:8px;font-size:10px;color:var(--muted);line-height:1.5}
+    .entropy-meter .label{color:var(--text);font-weight:500;margin-bottom:4px}
+    .entropy-meter .stat{display:flex;justify-content:space-between;margin-top:2px}
+    .entropy-meter .value{color:var(--accent);font-family:var(--mono)}
+    .precision-info{margin-top:8px;font-size:9px;color:var(--muted);display:flex;gap:2px}
+    .precision-info .dot{width:6px;height:6px;background:var(--accent);border-radius:50%;margin-top:2px}
     .balcard.checking{animation:balpulse 1s ease-in-out infinite}
     .balcard.checking .bal-state{color:var(--accent)}
+    .balcard.scanning{border-color:var(--accent);background:rgba(247,147,26,.05)}
+    .balcard.scanning .bal-state,.balcard.scanning .bal-btc{color:var(--accent)}
+    #scanBarFill{height:100%;width:0;border-radius:4px;background:linear-gradient(90deg,#f7931a,#ffd27f,#f7931a);background-size:200% 100%;animation:shimmer 1.1s linear infinite;transition:width .12s linear}
+    @keyframes shimmer{to{background-position:-200% 0}}
+    #resetToast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(10px);background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:9px 14px;font-size:12px;color:var(--text);z-index:30;opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;box-shadow:0 6px 24px -8px #000}
+    #resetToast.show{opacity:1;transform:translateX(-50%) translateY(0)}
     .balcard.empty{border-color:#2a3340}
     .balcard.error .bal-state,.balcard.limit .bal-state{color:#e0b155}
     .balcard.error,.balcard.limit{border-color:#5a4a2a;background:rgba(224,177,85,.06)}
@@ -121,10 +150,10 @@
       <div class="bar">
         <div class="field"><label>X axis · 2^</label><input id="ax" type="number" value="128" min="1" max="255" /></div>
         <div class="field"><label>Y axis · 2^</label><input id="ay" type="number" value="128" min="1" max="255" /></div>
-        <div class="field" style="min-width:150px"><label>pen · <span id="penVal">16</span><span id="penWarn" style="color:#f0616d;display:none"> · big = laggy</span></label><input id="penRange" type="range" min="10" max="40" value="16" step="1" /></div>
-        <div class="field"><label>exact</label><input id="pen" type="number" value="16" min="1" max="128" /></div>
+        <div class="field" style="min-width:150px"><label>pen · <span id="penVal">16</span><span id="penWarn" style="color:#e0b155;display:none"> · streams live</span></label><input id="penRange" type="range" min="1" max="1000" value="16" step="1" /></div>
+        <div class="field"><label>exact</label><input id="pen" type="number" value="16" min="1" max="1000000" /></div>
         <button class="primary" id="apply">Apply</button>
-        <button class="ghost" id="clear">Clear</button>
+        <button class="ghost" id="clear" title="1× soft — grays your tiles &amp; zeroes the count · 2× fast — full wipe">Reset ⟲</button>
         <button class="ghost" id="rand">Random</button>
         <button class="ghost" id="about">About</button>
         <label class="field" style="flex-direction:row;align-items:center;gap:6px;color:var(--muted);font-size:12px"><input type="checkbox" id="raw" style="width:auto" /> Raw HTML</label>
@@ -136,6 +165,8 @@
       <canvas id="trail"></canvas>
       <div id="cursor"></div>
       <div class="hint">click = scan patch · drag = pan · scroll = zoom · minimap = teleport</div>
+      <div id="fpsCounter" style="position:absolute;right:14px;top:14px;font-size:11px;font-family:var(--mono);color:var(--accent);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px);min-width:60px;text-align:right">60 fps</div>
+      <div id="precisionInfo" style="position:absolute;right:14px;top:50px;font-size:9px;font-family:var(--mono);color:var(--muted);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px)">cell: 0.000×</div>
       <div id="intro"><div class="card">
         <h2>What is this?</h2>
         <p><b>Every square is one private key — one possible Bitcoin wallet.</b></p>
@@ -152,6 +183,19 @@
         <div class="bal-cap" id="balGotCap" style="display:none">you got from this click</div>
         <div class="bal-btc" id="balBtc">— BTC</div>
         <div class="bal-usd" id="balUsd"></div>
+        <div id="scanBarWrap" style="display:none;margin-top:11px">
+          <div style="height:6px;background:var(--panel2);border-radius:4px;overflow:hidden">
+            <div id="scanBarFill" style="height:100%;width:0"></div>
+          </div>
+          <div style="font-size:9px;color:var(--muted);margin-top:6px;display:flex;justify-content:space-between">
+            <span id="scanStats">—</span><span id="scanRate">—</span>
+          </div>
+        </div>
+        <div id="balMeta" style="display:none;margin-top:10px;font-size:9px;color:var(--muted);padding-top:10px;border-top:1px solid var(--border)">
+          <div id="balSource" style="margin-bottom:4px"><span style="color:var(--accent)">✓</span> via <span id="balSourceName">—</span></div>
+          <div id="balTimestamp" style="font-family:var(--mono);font-size:8px"></div>
+        </div>
+        <div id="entropyDisplay" style="display:none"></div>
         <a id="balLink" href="#" target="_blank" rel="noopener" style="display:none;font-size:11px">verify on blockstream.info ↗</a>
         <div class="bal-field" id="balAddrField" style="display:none">
           <div class="bal-cap">public address</div>
@@ -161,6 +205,7 @@
           <div class="bal-cap">private key (this cell's number)</div>
           <div class="bal-addr" id="balKey"></div>
         </div>
+        <button class="ghost" id="expandPatch" style="display:none;width:100%;margin-top:10px;font-size:11px">▾ wallets in patch</button>
       </div>
       <div class="metrics">
         <div class="metric"><div class="k">keys scanned</div><div class="v" id="mScanned">0</div></div>
@@ -182,8 +227,8 @@
         <div id="goErr" style="color:#f0616d;font-size:11px;margin-top:6px;display:none"></div>
         <button class="ghost" id="calc" style="margin-top:8px;width:100%">Key → address…</button>
       </div>
-      <div class="kv addr-list"><div class="k">wallets in patch (<span id="addrCount">0</span>) · click one to reveal its key</div>
-        <div id="addrs" style="max-height:220px;overflow:auto;margin-top:4px"></div>
+      <div class="kv addr-list" id="patchBox" hidden><div class="k">wallets in patch (<span id="addrCount">0</span>) · click one to reveal its key</div>
+        <div id="addrs" style="max-height:260px;overflow:auto;margin-top:4px"></div>
         <div id="picked" style="margin-top:6px;font-size:11px;color:var(--accent);word-break:break-all"></div></div>
       <button id="share" class="primary" style="width:100%">Share my result</button>
       <div class="note">These are real, valid Bitcoin addresses. They are all empty — a funded one is a ~10⁻⁴¹ event you will never see. This is a map for feeling the scale, not finding coins. Your progress is saved on this device.</div>
@@ -199,7 +244,14 @@
       <div id="calcOut" style="font-family:var(--mono);font-size:12px;color:var(--text);margin-top:8px;word-break:break-all"></div>
     </div>
   </div>
-  <script type="module">import { dopamine } from "./dopamine.js?v=1"; window.dopamine = dopamine;</script>
-  <script src="app.js"></script>
+  <div id="resetToast"></div>
+  <div id="candidateShelf">
+    <div class="shelf-header">
+      <div><span id="candidateCount">0</span> potential keys found · click to verify</div>
+      <button class="ghost" id="clearShelf" style="font-size:10px;padding:4px 8px">clear</button>
+    </div>
+    <div class="shelf-items" id="shelfItems"></div>
+  </div>
+  <script type="module" src="app.js"></script>
 </body>
 </html>
