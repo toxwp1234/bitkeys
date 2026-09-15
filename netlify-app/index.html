@@ -38,6 +38,11 @@
     .field{display:flex;flex-direction:column;gap:4px}
     .field label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
     .field input{background:var(--panel);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:13px;padding:7px 9px;border-radius:8px;outline:none;width:74px}
+    /* pen powers of two: 1..8 -> 2^n */
+    #penPow{display:flex;gap:3px;margin-top:2px}
+    #penPow button{flex:1;min-width:0;padding:3px 0;font-family:var(--mono);font-size:10px;font-weight:600;line-height:1.4;border-radius:5px;background:#000;border:1px solid var(--border);color:var(--muted)}
+    #penPow button:hover{border-color:var(--accent);color:var(--text)}
+    #penPow button.on{background:var(--accent);border-color:var(--accent);color:#000}
     button{background:var(--panel2);color:var(--text);border:1px solid var(--border);font-family:var(--sans);font-weight:500;font-size:13px;padding:8px 15px;border-radius:8px;cursor:pointer;transition:background .12s,border-color .12s,transform .05s}
     button:hover{background:#232a35;border-color:#3a4454}
     button:active{transform:translateY(1px)}
@@ -46,11 +51,18 @@
     button.ghost{background:transparent;color:var(--muted)}
     button.ghost:hover{color:var(--text);background:var(--panel)}
     /* stage */
-    #stage{position:relative;overflow:hidden;cursor:crosshair;user-select:none}
+    #stage{position:relative;overflow:hidden;cursor:none;user-select:none}
     #grid{position:absolute;inset:0;background-color:#0a0c10;
       background-image:linear-gradient(to right,#1a2029 1px,transparent 1px),linear-gradient(to bottom,#1a2029 1px,transparent 1px);}
     #trail{position:absolute;inset:0}
-    #cursor{position:absolute;top:0;left:0;border:2px solid var(--accent);background:rgba(247,147,26,.10);pointer-events:none;will-change:transform,width,height}
+    #cursor{position:absolute;top:0;left:0;box-sizing:border-box;border:1px solid rgba(247,147,26,.9);
+      background:rgba(247,147,26,.28);pointer-events:none;will-change:transform,width,height;z-index:2}
+    #cursor.cursor-void{border-color:rgba(139,147,163,.7);background:rgba(139,147,163,.12);border-style:dashed}
+    #cursor.cursor-park{border-style:dashed;background:transparent}
+    #dot.dot-void{background:#8b93a3;box-shadow:0 0 0 1.5px rgba(10,12,16,.9)}
+    #dot{position:absolute;top:0;left:0;width:7px;height:7px;margin:-3.5px 0 0 -3.5px;border-radius:50%;
+      background:var(--accent);box-shadow:0 0 0 1.5px rgba(10,12,16,.9),0 0 8px -1px var(--accent);
+      pointer-events:none;will-change:transform;z-index:3}
     .hint{position:absolute;left:14px;bottom:12px;color:var(--muted);font-size:12px;background:rgba(13,15,19,.7);padding:6px 10px;border-radius:8px;backdrop-filter:blur(4px)}
     /* on-screen zoom controls + scale indicator */
     #zoomCtl{position:absolute;right:14px;bottom:16px;display:flex;flex-direction:column;gap:6px;z-index:4}
@@ -58,7 +70,7 @@
     #zoomCtl button:hover{background:rgba(247,147,26,.16);border-color:var(--accent);color:var(--accent);box-shadow:0 0 16px -4px var(--accent)}
     #zoomCtl button:active{transform:scale(.9)}
     #zoomCtl .zc-sep{height:1px;background:var(--border);margin:3px 5px}
-    #zoomScale{position:absolute;right:14px;top:50px;width:158px;background:rgba(13,15,19,.82);border:1px solid var(--border);border-radius:10px;padding:9px 11px;backdrop-filter:blur(6px);z-index:4;font-family:var(--mono)}
+    #zoomScale{display:none;position:absolute;right:14px;top:50px;width:158px;background:rgba(13,15,19,.82);border:1px solid var(--border);border-radius:10px;padding:9px 11px;backdrop-filter:blur(6px);z-index:4;font-family:var(--mono)}
     #zoomScale .zs-top{display:flex;justify-content:space-between;align-items:baseline}
     #zoomScale .zs-top span:first-child{font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)}
     #zoomScale #zsFactor{color:var(--accent);font-weight:600;font-size:13px}
@@ -82,7 +94,7 @@
     .kv{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
     .kv .k{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px}
     .kv .v{font-family:var(--mono);font-size:12px;word-break:break-all}
-    #minimap{width:100%;aspect-ratio:1;display:block;background:#0a0c10;border-radius:8px;cursor:pointer}
+    .minimap-wrapper{display:none}
     .addr-list .row{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--muted);padding:3px 4px;border-radius:5px;word-break:break-all;cursor:pointer}
     .addr-list .row .ra{flex:1;min-width:0;word-break:break-all}
     .addr-list .row .dot{width:12px;height:12px;flex:none;display:grid;place-items:center;font-size:10px;line-height:1}
@@ -185,11 +197,8 @@
         <p class="sub">every Bitcoin private key that could ever exist — click to scan a patch</p>
       </div>
       <div class="bar">
-        <div class="field"><label>X axis · 2^</label><input id="ax" type="number" value="128" min="1" max="255" /></div>
-        <div class="field"><label>Y axis · 2^</label><input id="ay" type="number" value="128" min="1" max="255" /></div>
-        <div class="field" style="min-width:150px"><label>pen · <span id="penVal">16</span><span id="penWarn" style="color:#e0b155;display:none"> · streams live</span></label><input id="penRange" type="range" min="1" max="1000" value="16" step="1" /></div>
-        <div class="field"><label>exact</label><input id="pen" type="number" value="16" min="1" max="1000000" /></div>
-        <button class="primary" id="apply">Apply</button>
+        <div class="field" style="min-width:150px"><label>pen · <span id="penVal">16</span><span id="penWarn" style="color:#e0b155;display:none"> · streams live</span></label><input id="penRange" type="range" min="1" max="110" value="16" step="1" /><div id="penPow"><button type="button" data-pow="1" title="pen 2">1</button><button type="button" data-pow="2" title="pen 4">2</button><button type="button" data-pow="3" title="pen 8">3</button><button type="button" data-pow="4" title="pen 16">4</button><button type="button" data-pow="5" title="pen 32">5</button><button type="button" data-pow="6" title="pen 64">6</button><button type="button" data-pow="7" title="pen 128">7</button><button type="button" data-pow="8" title="pen 256">8</button></div></div>
+        <div class="field"><label>exact</label><input id="pen" type="number" value="16" min="2" max="1000000" step="2" /></div>
         <button class="ghost" id="clear" title="1× soft — grays your tiles &amp; zeroes the count · 2× fast — full wipe">Reset ⟲</button>
         <button class="ghost" id="rand">Random</button>
         <button class="ghost" id="about">About</button>
@@ -201,7 +210,9 @@
       <div id="grid"></div>
       <canvas id="trail"></canvas>
       <div id="cursor"></div>
+      <div id="dot"></div>
       <div class="hint">click = scan patch · drag = pan · scroll / buttons = zoom</div>
+      <div id="zoomLevel" style="position:absolute;right:14px;top:50px;font-size:12px;font-family:var(--mono);color:var(--text);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px);min-width:60px;text-align:right;transition:color .2s;z-index:4">1x</div>
       <div id="fpsCounter" style="position:absolute;right:14px;top:14px;font-size:11px;font-family:var(--mono);color:var(--accent);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px);min-width:60px;text-align:right">60 fps</div>
       <div id="precisionInfo" style="display:none;position:absolute;right:14px;top:50px;font-size:9px;font-family:var(--mono);color:var(--muted);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px)">cell: 0.000×</div>
       <div id="zoomScale">
@@ -269,7 +280,7 @@
       <div class="kv"><div class="k">last patch · key (hex)</div><div class="v" id="kHex">— click the map —</div></div>
       <div class="kv"><div class="k">explored of 2²⁵⁶</div><div class="v" id="kFrac">0 %</div></div>
       <div class="kv" style="padding:10px">
-        <canvas id="minimap" width="288" height="288" style="display:none"></canvas>
+        <div class="minimap-wrapper"><canvas id="minimap-heatmap" width="288" height="288"></canvas></div>
         <div class="k" style="margin-bottom:8px">location · cursor cell · scroll to zoom</div>
         <div class="v" id="loc" style="font-size:11px">x — · y —</div></div>
       <div class="kv">
@@ -297,6 +308,13 @@
       <div class="go" style="margin-top:10px"><button class="primary" id="calcGo">Compute</button><button class="ghost" id="calcClose">Close</button></div>
       <div id="calcErr" style="color:#f0616d;font-size:12px;margin-top:8px"></div>
       <div id="calcOut" style="font-family:var(--mono);font-size:12px;color:var(--text);margin-top:8px;word-break:break-all"></div>
+    </div>
+  </div>
+  <div id="wipeModal" style="position:fixed;inset:0;z-index:21;display:none;align-items:center;justify-content:center;background:rgba(10,12,16,.74);backdrop-filter:blur(3px);padding:20px">
+    <div style="max-width:420px;width:100%;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:22px 24px">
+      <h2 style="margin:0 0 8px;font-size:18px;font-weight:600">Erase the whole trail?</h2>
+      <p style="margin:0 0 16px;color:var(--muted);font-size:13px;line-height:1.6">Every patch, all the gray territory you have already covered and the key count go with it. Saved candidates are cleared too. This cannot be undone.</p>
+      <div class="go" style="display:flex;gap:8px"><button class="ghost" id="wipeNo">Keep it</button><button class="primary" id="wipeYes">Erase everything</button></div>
     </div>
   </div>
   <div id="resetToast"></div>
