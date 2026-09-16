@@ -837,10 +837,24 @@ function reportBalance(job, res) {
 worker.onmessage = (e) => {
   const msg = e.data;
   // ---- Bloom lifecycle ----
-  if (msg.type === "bloomProgress") return;             // silent background load, no UI
-  if (msg.type === "bloomReady") { bloomReady = true; return; }
-  if (msg.type === "bloomError") {                      // transient? retry once, quietly
-    if (!bloomRetried) { bloomRetried = true; setTimeout(() => worker.postMessage({ type: "loadBloom", base: BLOOM_BASE }), 4000); }
+  if (msg.type === "bloomProgress") {
+    const pct = msg.total ? Math.floor(msg.loaded / msg.total * 100) : 0;
+    setFilterStatus(pct + "%", "var(--muted)", "downloading the Bloom filter — " + pct + "%");
+    return;
+  }
+  if (msg.type === "bloomReady") {
+    bloomReady = true;
+    setFilterStatus("ready", "#4fb98a", "Bloom filter loaded — scans flag candidate wallets");
+    return;
+  }
+  if (msg.type === "bloomError") {                      // transient? retry once — but say so
+    if (!bloomRetried) {
+      bloomRetried = true;
+      setFilterStatus("retrying", "#e0b155", "filter download failed, retrying: " + msg.error);
+      setTimeout(() => worker.postMessage({ type: "loadBloom", base: BLOOM_BASE }), 4000);
+    } else {
+      setFilterStatus("offline", "#f0616d", "Bloom filter unavailable — scans cannot flag candidates. " + msg.error);
+    }
     return;
   }
   if (msg.type === "calcResult") {                      // key -> address modal
@@ -1695,10 +1709,25 @@ $("#addrs").addEventListener("click", (e) => {
 // and is patched into worker memory silently. Until it's ready, scans fall back to the
 // live API path. Local dev serves parts from /bloom/; production from jsDelivr.
 const IS_LOCAL = location.hostname === "127.0.0.1" || location.hostname === "localhost";
+// Pinned to the commit that shipped the chunks, not to a branch: a commit URL is immutable, so
+// jsDelivr can cache it forever and can never hand out a manifest from one version with parts
+// from another. The old value pointed at a tag (bloom-v1) that was never created and a folder
+// (bloom/) that does not exist — every production load 404'd, silently, and every scan found 0.
+// If the filter is ever rebuilt, bump this to the commit that ships the new chunks.
+const BLOOM_COMMIT = "99a865b0bdceb18f8207e9a7c80a39e8fd1e3964";
 const BLOOM_BASE = IS_LOCAL
   ? "/bloom/"
-  : "https://cdn.jsdelivr.net/gh/toxwp1234/bitkeys@bloom-v1/bloom/";   // TODO: confirm tag/path at deploy
+  : "https://cdn.jsdelivr.net/gh/toxwp1234/bitkeys@" + BLOOM_COMMIT + "/data/bloom_chunks/";
 let bloomReady = false, bloomRetried = false;
+// The filter's state is on screen now. It used to load with no UI at all, which is exactly how a
+// broken URL went unnoticed: no candidates, no colour, and nothing saying why.
+function setFilterStatus(text, color, title) {
+  const el = $("#statFilter"); if (!el) return;
+  if (el.textContent !== text) el.textContent = text;
+  el.style.color = color || "";
+  const wrap = $("#statFilterWrap"); if (wrap) wrap.title = title || "";
+}
+setFilterStatus("loading", "var(--muted)", "downloading the Bloom filter (~126 MB, cached after the first visit)");
 worker.postMessage({ type: "loadBloom", base: BLOOM_BASE });
 
 // ---------- checkpoint + grid toggle ----------
