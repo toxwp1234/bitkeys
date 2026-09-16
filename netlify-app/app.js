@@ -1,5 +1,6 @@
 "use strict";
 import { dopamine } from "./dopamine.js?v=2";
+import { PALETTES, DEFAULT_PALETTE, DEFAULT_GRID, rampOf, paletteById, rgba } from "./palettes.js";
 const $ = (s) => document.querySelector(s);
 const stage = $("#stage");
 
@@ -60,6 +61,8 @@ const aX = 128n, aY = 128n;   // the map IS the Bitcoin keyspace; there is nothi
 let W = 2n ** aX, H = 2n ** aY;
 let cellPx = 28;
 let gliding = false, travelTimer = 0;   // true while a smooth approach is in flight
+let home = null, homeArmed = false;    // the checkpoint, and "the next map click plants it"
+let gridOn = true;
 let raw = false;
 let lastScan = null;
 let landing = null;        // last teleport target
@@ -182,15 +185,29 @@ function gridLevels() {
   const mainExp = base + j, subExp = Math.round(Math.log2(sub));
   return { coarseExp: Math.max(mainExp, subExp), fineCells: Math.pow(2, Math.min(mainExp, subExp)) };
 }
-const GRID_MAIN_IMG = "linear-gradient(to right,rgba(247,147,26,.32) 1px,transparent 1px)," +
-                      "linear-gradient(to bottom,rgba(247,147,26,.32) 1px,transparent 1px)";
+// The lattice takes its colour from the active theme too — the map should feel like one
+// thing, not a themed trail under a fixed amber cage. Rebuilt in setPalette(), not per frame.
+let gridColor = DEFAULT_GRID;
+let GRID_MAIN_IMG = "", GRID_SUB_RGBA = "", GRID_EDGE_RGBA = "";
+function buildGridColors() {
+  GRID_MAIN_IMG = "linear-gradient(to right," + rgba(gridColor, .32) + " 1px,transparent 1px)," +
+                  "linear-gradient(to bottom," + rgba(gridColor, .32) + " 1px,transparent 1px)";
+  GRID_SUB_RGBA = rgba(gridColor, .13);
+  GRID_EDGE_RGBA = rgba(gridColor, .55);
+}
+buildGridColors();
 const subImgFor = (p) => {
-  const a = Math.max(0, p - 1) + "px", b = p + "px", c = "rgba(247,147,26,.13)";
+  const a = Math.max(0, p - 1) + "px", b = p + "px", c = GRID_SUB_RGBA;
   const stops = (dir) => "repeating-linear-gradient(to " + dir +
     ",transparent 0,transparent " + a + "," + c + " " + a + "," + c + " " + b + ")";
   return stops("right") + "," + stops("bottom");
 };
 let gridImg = "";
+const lastFrame = { grid: null, clip: null };
+// While an image is being rendered: exportScale replaces the screen DPR (so edges snap to the
+// export's own pixels), and exportClean hides everything that is UI rather than map — the
+// home checkpoint, the landing marker, the dashed in-flight outline.
+let exportScale = 0, exportClean = false;   // what draw() last put on screen — read by snapshotMap()
 
 let pending = false;
 let frameCount = 0, lastFpsUpdate = 0, currentFps = 60;
@@ -245,9 +262,13 @@ function draw() {
     imgs.push(subImgFor(subPitch));
     gridSubDiv = BigInt(sub);
   }
+  // Lines off: an EMPTY background-image just falls back to the stylesheet's own #grid rule,
+  // so it has to be an explicit "none". The background colour and the keyspace clip stay.
+  if (!gridOn) imgs.length = 0;
   const sizes = [], poss = [];
   for (let i = 0; i < imgs.length; i++) { sizes.push(box, box); poss.push(pos, pos); }
-  const img = imgs.join(",");
+  const img = imgs.length ? imgs.join(",") : "none";
+  lastFrame.grid = { on: imgs.length > 0, mainPitch, subPitch, phX, phY, sub: imgs.length > 1 };
   if (img !== gridImg) { grid.style.backgroundImage = img; gridImg = img; }
   grid.style.backgroundSize = sizes.join(",");
   grid.style.backgroundPosition = poss.join(",");
@@ -271,6 +292,7 @@ function draw() {
 
   const clipL = Math.max(0, kx1), clipT = Math.max(0, ky1);
   const clipR = Math.min(w, kx2), clipB = Math.min(h, ky2);
+  lastFrame.clip = { l: clipL, t: clipT, r: clipR, b: clipB };
   grid.style.clipPath =
     `polygon(${clipL}px ${clipT}px, ${clipR}px ${clipT}px, ${clipR}px ${clipB}px, ${clipL}px ${clipB}px)`;
 
@@ -288,7 +310,7 @@ function draw() {
   // transform, so rounding in CSS pixels is not enough). A fractional fillRect antialiases
   // its border, and two of those meeting leave a visible seam down the join — patches that
   // touch in key space have to touch on screen with nothing between them.
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = exportScale || window.devicePixelRatio || 1;
   const snap = (v) => Math.round(v * dpr) / dpr;
   function drawPatch(p) {
     const s = p.c * cellPx;
@@ -311,7 +333,33 @@ function draw() {
   // current session, drawn on top — tinted by how many candidates the patch turned up
   if (raw) { tctx.fillStyle = "#000000"; for (const p of patches) drawPatch(p); }
   else for (const p of patches) { tctx.fillStyle = patchFill(p); drawPatch(p); }
-  if (landing) {   // where you teleported: one key, red while it is the live target
+  // The square currently under the drill: an outline only. It is not painted until the scan
+  // finishes, but a 65,536-key dig takes a while and a click with no feedback at all reads
+  // as a dead click.
+  const q = !exportClean && scanActive && pendingScan && pendingScan.pending;
+  if (q && !raw) {
+    const sz = q.c * cellPx;
+    const sx = Number(q.x - viewX) * cellPx - subX, sy = Number(q.y - viewY) * cellPx - subY;
+    if (sz >= 3 && sx <= w && sy <= h && sx + sz >= 0 && sy + sz >= 0) {
+      tctx.save();
+      tctx.setLineDash([4, 3]);
+      tctx.strokeStyle = GRID_EDGE_RGBA;
+      tctx.lineWidth = 1;
+      tctx.strokeRect(sx + 0.5, sy + 0.5, sz - 1, sz - 1);
+      tctx.restore();
+    }
+  }
+  if (home && !exportClean) {   // the checkpoint — same one-key shape as the landing marker, but white
+    const hx = Number(home.x - viewX) * cellPx - subX;
+    const hy = Number(home.y - viewY) * cellPx - subY;
+    const s = Math.max(cellPx, 10);
+    tctx.fillStyle = "rgba(255,255,255,0.22)";
+    tctx.fillRect(hx, hy, s, s);
+    tctx.strokeStyle = "#f4f7fa";
+    tctx.lineWidth = 2;
+    tctx.strokeRect(hx + 0.5, hy + 0.5, s - 1, s - 1);
+  }
+  if (landing && !exportClean) {   // where you teleported: one key, red while it is the live target
     const lx = Number(landing.x - viewX) * cellPx - subX;
     const ly = Number(landing.y - viewY) * cellPx - subY;
     const s = Math.max(cellPx, 10);
@@ -324,7 +372,7 @@ function draw() {
   tctx.restore();
   // edge of the keyspace — the hard limit the cursor is clamped to
   if (kx2 > kx1 && ky2 > ky1) {
-    tctx.strokeStyle = raw ? "#000000" : "rgba(247,147,26,0.55)";
+    tctx.strokeStyle = raw ? "#000000" : GRID_EDGE_RGBA;
     tctx.lineWidth = 1.5;
     tctx.strokeRect(kx1 + 0.5, ky1 + 0.5, kx2 - kx1, ky2 - ky1);
   }
@@ -355,47 +403,44 @@ function centerKeyspace() {
   if (kh <= h) { viewY = 0n; subY = -(h - kh) / 2; }
 }
 
-// ---------- candidate density ----------
-// Every patch remembers how many of its keys the Bloom filter flagged — the ones that
-// actually get sent to the balance API — so the map can show WHERE the hits were, not just
-// that you have been somewhere. Density is flagged / keys in the patch.
-// The ramp is one sweep of hue at a deliberately low chroma — more colours than before, each
-// quieter than before. It never enters the 30-50 deg band: that is where the BTC orange of the
-// grid and the pen live, and where the red landing marker sits, so a dense patch can never be
-// read as a grid line or as "you teleported here". The stops crowd the LOW end (0.01, 0.05,
-// 0.15) because that is where real data lives — a 256-key patch with one hit is 0.004 — so the
-// hues actually separate in the range you will see, instead of all collapsing onto the floor.
-// Anchors are yours: <= 1% stays cool, >= 95% is fully hot.
-const DENSITY_RAMP = [
-  [0.00, [31, 111, 136]],    // teal          — nothing flagged (the colour patches always had)
-  [0.01, [47, 143, 138]],    // sea
-  [0.05, [79, 157, 122]],    // jade
-  [0.15, [111, 147, 196]],   // steel blue
-  [0.35, [138, 127, 201]],   // periwinkle
-  [0.60, [168, 119, 196]],   // mauve
-  [0.80, [196, 115, 153]],   // dusty rose
-  [0.95, [212, 104, 127]],   // soft crimson  — saturated with candidates
-];
-// One hit is worth seeing, but it must not cost an outline: a stroke draws the edge of every
-// patch, which turns a run of neighbours into a tiled wall of boxes, and a corner mark just
-// reads as a stray discoloured pixel. So the accent lives in the FILL — a patch that flagged
-// anything sits a touch brighter than its density alone would put it. Still one flat colour
-// edge to edge, so patches keep merging into each other.
-const HIT_LIFT = 0.18;
-function patchFill(p) {
-  return densityColor(patchDensity(p), 1, p.h ? HIT_LIFT : 0);
+// ---------- candidate heat ----------
+// Every patch remembers how many of its keys the Bloom filter flagged — the ones that get
+// sent to the balance API — and the colour is driven by that COUNT, not by density.
+// Density was working against you: a big brush scans more keys, so a real find got divided
+// by a bigger area and came out paler than a lucky small patch. Count does the opposite,
+// which is the point — dig wide, turn up more, and the square says so.
+let paletteId = DEFAULT_PALETTE;
+let HEAT_RAMP = rampOf(paletteById(paletteId));
+function setPalette(id) {
+  const pal = paletteById(id);
+  paletteId = pal.id;
+  HEAT_RAMP = rampOf(pal);
+  gridColor = pal.grid || DEFAULT_GRID;
+  buildGridColors();
+  gridImg = "";                 // the background-image cache keys on the string, so drop it
+  render();
+  positionCursor();
 }
-function patchDensity(p) {
-  const area = p.c * p.c;
-  return area > 0 ? clampN((p.h || 0) / area, 0, 1) : 0;
+
+// Each hit has to move the colour less than the one before it, but never so little that you
+// cannot see it. log1p does exactly that: the first find is a jump, the tenth is a nudge, and
+// nothing ever lands on the same colour twice. HEAT_FULL is where the ramp runs out — chosen
+// so the whole plausible range is spent on it (a 2^8 brush is 65,536 keys, and at the filter's
+// ~1.2e-4 false-positive rate that is ~8 candidates on an ordinary dig).
+const HEAT_FULL = 24;
+const HEAT_DENOM = Math.log1p(HEAT_FULL);
+function patchHeat(p) {
+  const h = p.h || 0;
+  return h > 0 ? clampN(Math.log1p(h) / HEAT_DENOM, 0, 1) : 0;
 }
-function densityColor(d, alpha, lift) {
+function patchFill(p) { return heatColor(patchHeat(p), 1); }
+function heatColor(t, alpha, lift) {
   let i = 0;
-  while (i < DENSITY_RAMP.length - 2 && d > DENSITY_RAMP[i + 1][0]) i++;
-  const [d0, c0] = DENSITY_RAMP[i], [d1, c1] = DENSITY_RAMP[i + 1];
-  const t = d1 > d0 ? clampN((d - d0) / (d1 - d0), 0, 1) : 0;
+  while (i < HEAT_RAMP.length - 2 && t > HEAT_RAMP[i + 1][0]) i++;
+  const [t0, c0] = HEAT_RAMP[i], [t1, c1] = HEAT_RAMP[i + 1];
+  const u = t1 > t0 ? clampN((t - t0) / (t1 - t0), 0, 1) : 0;
   const ch = (k) => {
-    const v = c0[k] + (c1[k] - c0[k]) * t;
+    const v = c0[k] + (c1[k] - c0[k]) * u;
     return Math.round(lift ? v + (255 - v) * lift : v);
   };
   return "rgba(" + ch(0) + "," + ch(1) + "," + ch(2) + "," + alpha + ")";
@@ -452,12 +497,18 @@ function positionCursor() {
   }
 
   const [x, y] = cellUnder(mx, my);
+  // The full key under the cursor, not a truncated one — a 256-bit number with its middle
+  // cut out is not a number you can do anything with. Guarded so the DOM is not rewritten
+  // on every frame the cursor happens to sit still.
+  const hx = "0x" + x.toString(16), hy = "0x" + y.toString(16);
+  if (hx !== posShown.x) { posShown.x = hx; $("#posX").textContent = hx; }
+  if (hy !== posShown.y) { posShown.y = hy; $("#posY").textContent = hy; }
   const loc = $("#loc");
   const hp = patchAt(x, y);
   loc.innerHTML =
     `X ${pctOf(x, W)} <span style="color:var(--muted)">${shortHex(x, 5, 4)}</span><br>` +
     `Y ${pctOf(y, H)} <span style="color:var(--muted)">${shortHex(y, 5, 4)}</span>` +
-    (hp ? `<br><span style="color:${densityColor(patchDensity(hp), 1, 0.3)}">■</span> ` +
+    (hp ? `<br><span style="color:${heatColor(patchHeat(hp), 1, 0.3)}">■</span> ` +
           `${hp.h.toLocaleString("en-US")} / ${(hp.c * hp.c).toLocaleString("en-US")} ` +
           `<span style="color:var(--muted)">flagged</span>` : "");
   loc.title = "x 0x" + x.toString(16) + "\ny 0x" + y.toString(16);
@@ -500,22 +551,16 @@ function scanAt(x, y) {
   const kh = $("#kHex");
   kh.textContent = shortHex(k0, 8, 8);
   kh.title = "0x" + k0.toString(16);
-  // paint the patch instantly (optimistic); keysScanned now ticks up as the stream checks
-  let patch = patches.find((p) => p.c === penC && p.x === x && p.y === y);
-  if (!seen.has(key)) {
-    seen.add(key);
-    patch = { x, y, c: penC, h: 0, n: 0 };   // h = Bloom candidates, n = keys actually checked
-    patches.push(patch);
-    const mi = (toMMy(y) * MM + toMMx(x)) * 4;
-    if (mi >= 0 && mi < heatImg.data.length) { heatImg.data[mi] = 31; heatImg.data[mi + 1] = 111; heatImg.data[mi + 2] = 136; }
-    flushHeat();
-  }
-  $("#mPatches").textContent = patches.length.toLocaleString("en-US");
+  // Nothing is painted yet. The patch lands only once the scan actually finishes (see
+  // commitPatch) — clicking used to colour the square immediately, which meant you could
+  // spray the map faster than a single key could be checked and end up with territory you
+  // never scanned. A click that gets cancelled by the next click leaves no trace at all.
   render();
   // stream the WHOLE patch: pen n -> n*n keys, derived + bloom-checked in chunks, off-thread.
   // No cap — the machine goes as far/fast as it can; a new click cancels the running scan.
   const id = ++scanId;
-  pendingScan = { id, k0, W, cols: penC, total: penC * penC, checkedSoFar: 0, patch };
+  pendingScan = { id, k0, W, cols: penC, total: penC * penC, checkedSoFar: 0,
+                  pending: { x, y, c: penC, key } };   // becomes a real patch at scanDone
   lastScan = { k0, W, cols: penC };
   scanActive = true;
   balGen++; balBatch = { gen: balGen, total: 0, done: 0, funded: 0, failed: 0, scan: true };  // fresh balance session
@@ -807,7 +852,6 @@ worker.onmessage = (e) => {
   if (msg.type === "scanProgress") {
     if (!pendingScan || msg.id !== pendingScan.id) return;
     tickChecked(msg.checked);
-    recordPatchHits(msg.checked, msg.foundCount);
     if (msg.display) renderPatchList(msg.display, msg.total, msg.bloomOn);
     updateScanUI(msg.checked, msg.total, msg.foundCount, msg.bloomOn);
     if (msg.candidates && msg.candidates.length) {      // stream candidates into the throttled API queue
@@ -819,7 +863,7 @@ worker.onmessage = (e) => {
   if (msg.type === "scanDone") {
     if (!pendingScan || msg.id !== pendingScan.id) return;
     tickChecked(msg.checked);
-    recordPatchHits(msg.checked, msg.foundCount);
+    commitPatch(msg.checked, msg.foundCount);
     if (msg.display) renderPatchList(msg.display, msg.total, msg.bloomOn);
     scanActive = false;
     render(); scheduleSave();
@@ -828,14 +872,26 @@ worker.onmessage = (e) => {
   }
 };
 
-// The running candidate count belongs to the patch, not just to the scan panel — it is what
-// tints it on the map and what survives a reload.
-function recordPatchHits(checked, found) {
-  const p = pendingScan && pendingScan.patch;
-  if (!p) return;
-  const h = found | 0, n = checked | 0;
-  if (h === p.h && n === p.n) return;
-  p.h = h; p.n = n;
+// A patch exists once its scan has run to the end — not before. It carries how many keys the
+// Bloom filter flagged (h) and how many were actually checked (n), which is what tints it.
+// A cancelled scan commits nothing, so it costs no territory and earns no dig.
+function commitPatch(checked, found) {
+  const q = pendingScan && pendingScan.pending;
+  if (!q) return;
+  pendingScan.pending = null;
+  const p = { x: q.x, y: q.y, c: q.c, h: found | 0, n: checked | 0 };
+  const old = patches.find((o) => o.c === p.c && o.x === p.x && o.y === p.y);
+  if (old) { old.h = p.h; old.n = p.n; }          // re-dug the same square: refresh, do not duplicate
+  else {
+    seen.add(q.key);
+    patches.push(p);
+    creditDig();
+    const mi = (toMMy(p.y) * MM + toMMx(p.x)) * 4;
+    if (mi >= 0 && mi < heatImg.data.length) { heatImg.data[mi] = 31; heatImg.data[mi + 1] = 111; heatImg.data[mi + 2] = 136; }
+    flushHeat();
+  }
+  $("#mPatches").textContent = patches.length.toLocaleString("en-US");
+  refreshStats();
   render();
 }
 
@@ -847,6 +903,7 @@ function tickChecked(checked) {
   keysScanned += delta;
   $("#mScanned").textContent = keysScanned.toLocaleString("en-US");
   $("#kFrac").textContent = fracExplored();
+  setStat("keys", keysScanned.toLocaleString("en-US"));
 }
 
 // on-screen sample of the scanned addresses (the stream checks far more than this)
@@ -886,17 +943,22 @@ function updateScanUI(checked, total, found, bloomOn) {
   const rate = Math.round(checked / Math.max(0.001, (performance.now() - scanT0) / 1000));
   if ($("#scanStats")) $("#scanStats").textContent = found ? found.toLocaleString("en-US") + " potential ★" : "—";
   if ($("#scanRate")) $("#scanRate").textContent = rate.toLocaleString("en-US") + "/s";
+  setStat("rate", rate.toLocaleString("en-US") + "/s");
   $("#balState").textContent = bloomOn ? "scanning patch…" : "loading filter…";
   $("#balUsd").textContent = "of " + total.toLocaleString("en-US") + " · " + rate.toLocaleString("en-US") + "/s"
     + (found ? " · " + found.toLocaleString("en-US") + " candidate" + (found > 1 ? "s" : "") + " ★" : "");
 }
 function finishScanUI() {
   $("#scanBarWrap").style.display = "none";
+  setStat("rate", "0/s");                      // idle means idle, not "whatever the last burst hit"
   if (balBatch.done >= balBatch.total) {                // every potential already resolved by scan-end
     if (balBatch.scan) finishVerification();            // hide the checking box + chime (once)
     if (!balBatch.funded && !scanRevealed) { scanRevealed = true; showBloomEmpty2(); }
   } else if (!balBatch.funded) {                        // potentials still being fetched — DON'T claim 0 BTC yet
-    $("#balState").textContent = "verifying " + (balBatch.total - balBatch.done) + " potential key(s)…";
+    // This used to print total - done, so a scan that turned up 100 candidates and had
+    // verified 87 of them announced "13 potential keys" — the backlog, read as the find.
+    $("#balState").textContent = "verifying " + balBatch.done.toLocaleString("en-US") + " / "
+      + balBatch.total.toLocaleString("en-US") + " potential keys…";
     // the honest number reveals in reportBalance the moment the last potential resolves
   }
 }
@@ -974,6 +1036,7 @@ window.addEventListener("mouseup", (e) => {
     const r = stage.getBoundingClientRect();
     const mx = e.clientX - r.left, my = e.clientY - r.top;
     if (inVoid(mx, my, keyRect())) elasticReturn();   // clicked the void: pull the map back
+    else if (homeArmed) { const [x, y] = cellUnder(mx, my); setHome(x, y); }
     else { const [x, y] = cellUnder(mx, my); scanAt(x, y); }
   }
   down = false;
@@ -1125,12 +1188,13 @@ function glide(o) {
 // marker down so you can see where you are headed, hold for a beat, then descend slowly.
 // The descent is deliberately unhurried: every frame at this scale is expensive, and a
 // long ease hides that far better than a short one.
-function travelTo(cx, cy) {
+function travelTo(cx, cy, mark) {
   stopZoom();
   const lo = minZoom();
   const out = clampN(240 + 40 * Math.abs(Math.log2(zoomLevel / lo)), 240, 900);
   glide({ zoom: lo, ms: out, then: () => {
-    landing = { x: cx, y: cy }; landingStale = false; render();
+    if (mark !== false) { landing = { x: cx, y: cy }; landingStale = false; }
+    render();
     travelTimer = setTimeout(() => {              // 0.7 s to actually see the point on the whole map
       travelTimer = 0;
       glide({ zoom: approachZoom(), cx, cy, ms: 2600 });
@@ -1251,6 +1315,7 @@ function handleSoftReset() {
   patches = []; seen.clear(); keysScanned = 0;
   cancelActiveWork(); resetBalCard();
   $("#mScanned").textContent = "0"; $("#mPatches").textContent = "0"; $("#kFrac").textContent = fracExplored();
+  refreshStats();
   render();
   clearTimeout(saveTimer); saveState();            // persist immediately — don't rely on the rAF-debounced save
   showResetToast("soft reset — " + grayPatches.length.toLocaleString("en-US") + " patches kept as territory");
@@ -1261,6 +1326,7 @@ function handleHardReset() {                       // nuclear: nothing survives
   if (candidateDB) { try { candidateDB.transaction(CANDIDATE_STORE, "readwrite").objectStore(CANDIDATE_STORE).clear(); } catch (e) {} }
   updateCandidateShelf();
   $("#mScanned").textContent = "0"; $("#mPatches").textContent = "0"; $("#kFrac").textContent = "0 %";
+  refreshStats();
   render();
   clearTimeout(saveTimer); saveState();            // persist immediately — don't rely on the rAF-debounced save
   showResetToast("hard reset — clean slate");
@@ -1279,9 +1345,20 @@ function closeWipe() { wipeModal.style.display = "none"; }
 $("#wipeNo").addEventListener("click", closeWipe);
 $("#wipeYes").addEventListener("click", () => { closeWipe(); handleHardReset(); });
 wipeModal.addEventListener("click", (e) => { if (e.target === wipeModal) closeWipe(); });
+// ---------- progression: the brush is earned ----------
+// You start on 2^1. Ten fresh patches dug WITH your biggest brush unlock the next one, all the
+// way to 2^8; ten more at 2^8 unlock the slider and the exact field. Re-clicking a patch you
+// already scanned does not count — only new ground. Progression is persisted, and a reset does
+// not touch it: a reset clears the trail, not what you earned walking it.
+const PEN_START_EXP = 1, PEN_TOP_EXP = 8, DIGS_PER_UNLOCK = 10;
+let penExp = PEN_START_EXP;   // highest unlocked preset
+let penDigs = 0;              // fresh patches dug at that preset since the last unlock
+let penFree = false;          // slider + exact field earned
+const penCap = () => (penFree ? 1000000 : Math.pow(2, penExp));
+
 function setPen(v) {
   // Pen and zoom are unrelated: the brush changes size, the map does not move or rescale.
-  penC = clampN(Math.round(v) || 16, 1, 1000000);      // no ceiling but a sane guard; go as big as your machine allows
+  penC = clampN(Math.round(v) || 16, 1, penCap());
   $("#pen").value = penC;
   $("#penRange").value = clampN(penC, 1, 110);   // slider tops out at 110; the exact field is free
   $("#penVal").textContent = penC.toLocaleString("en-US");
@@ -1290,15 +1367,50 @@ function setPen(v) {
   render();
   positionCursor();
 }
-// The 1..8 buttons are just 2^n presets — lit in BTC orange only when the pen is exactly
-// that power, so a slider nudge off 32 drops the highlight instead of lying about it.
+// The 1..8 buttons are 2^n presets — lit in BTC orange only when the pen is exactly that
+// power, dimmed while still locked, and the next one fills up as you dig toward it.
 const penPowBtns = Array.from(document.querySelectorAll("#penPow button"));
 function syncPenPow() {
-  const n = Math.log2(penC);
-  const exact = Number.isInteger(n);
-  for (const b of penPowBtns) b.classList.toggle("on", exact && Number(b.dataset.pow) === n);
+  const n = Math.log2(penC), exact = Number.isInteger(n);
+  for (const b of penPowBtns) {
+    const e = Number(b.dataset.pow);
+    const locked = !penFree && e > penExp;
+    const next = !penFree && e === penExp + 1;
+    b.classList.toggle("on", exact && e === n);
+    b.classList.toggle("locked", locked);
+    b.classList.toggle("next", next);
+    b.disabled = locked;
+    b.title = locked
+      ? "locked — dig " + DIGS_PER_UNLOCK + " patches with pen " + Math.pow(2, penExp)
+      : "pen " + Math.pow(2, e);
+    if (next) b.style.setProperty("--pg", Math.round(penDigs / DIGS_PER_UNLOCK * 100) + "%");
+    else b.style.removeProperty("--pg");
+  }
+  $("#penRange").disabled = !penFree;
+  $("#pen").disabled = !penFree;
+  const q = $("#penQuest");
+  if (q) {
+    const left = DIGS_PER_UNLOCK - penDigs;
+    q.innerHTML = penFree
+      ? "every brush unlocked · slider free"
+      : "dig <b>" + left + "</b> more with pen <b>" + Math.pow(2, penExp) + "</b> → "
+        + (penExp < PEN_TOP_EXP ? "pen " + Math.pow(2, penExp + 1) : "the slider");
+  }
 }
-for (const b of penPowBtns) b.addEventListener("click", () => setPen(Math.pow(2, Number(b.dataset.pow))));
+// called once per FRESH patch — re-digging old ground is not progress
+function creditDig() {
+  if (penFree || penC !== Math.pow(2, penExp)) return;
+  if (++penDigs < DIGS_PER_UNLOCK) { syncPenPow(); return; }
+  penDigs = 0;
+  if (penExp < PEN_TOP_EXP) { penExp++; showResetToast("pen " + Math.pow(2, penExp) + " unlocked"); }
+  else { penFree = true; showResetToast("slider unlocked — any brush size is yours"); }
+  syncPenPow();
+}
+for (const b of penPowBtns) b.addEventListener("click", () => {
+  const e = Number(b.dataset.pow);
+  if (!penFree && e > penExp) return;
+  setPen(Math.pow(2, e));
+});
 $("#pen").addEventListener("input", (e) => setPen(parseInt(e.target.value)));
 $("#penRange").addEventListener("input", (e) => setPen(parseInt(e.target.value)));
 $("#raw").addEventListener("change", (e) => { raw = e.target.checked; document.body.classList.toggle("raw", raw); render(); });
@@ -1312,9 +1424,10 @@ function saveState() {
   try {
     const kept = patches.slice(-PATCH_CAP);
     localStorage.setItem(STORE, JSON.stringify({
-      aX: aX.toString(), aY: aY.toString(), penC, cellPx,
+      aX: aX.toString(), aY: aY.toString(), penC, cellPx, penExp, penDigs, penFree,
       viewX: viewX.toString(), viewY: viewY.toString(), subX, subY,
-      keysScanned,
+      keysScanned, gridOn, paletteId,
+      home: home ? [home.x.toString(), home.y.toString()] : null,
       patches: kept.map((p) => [p.x.toString(), p.y.toString(), p.c, p.h || 0, p.n || 0]),
       grayPatches: grayPatches.slice(-PATCH_CAP).map((p) => [p.x.toString(), p.y.toString(), p.c, p.h || 0, p.n || 0]),
     }));
@@ -1338,16 +1451,22 @@ function loadState() {
   try { s = JSON.parse(localStorage.getItem(STORE) || "null"); } catch (e) { s = null; }
   if (!s) return false;
   try {
+    penExp = clampN(s.penExp | 0 || PEN_START_EXP, PEN_START_EXP, PEN_TOP_EXP);
+    penDigs = clampN(s.penDigs | 0, 0, DIGS_PER_UNLOCK - 1);
+    penFree = !!s.penFree;
     penC = s.penC || 16; cellPx = s.cellPx || 28;   // axes are fixed; an old save's aX/aY is ignored
     viewX = BigInt(s.viewX || "0"); viewY = BigInt(s.viewY || "0");
     subX = s.subX || 0; subY = s.subY || 0;
     keysScanned = s.keysScanned || 0;
+    gridOn = s.gridOn !== false;
+    setPalette(s.paletteId || DEFAULT_PALETTE);
+    home = s.home ? { x: BigInt(s.home[0]), y: BigInt(s.home[1]) } : null;
     patches = (s.patches || []).map(([x, y, c, h, n]) => ({ x: BigInt(x), y: BigInt(y), c, h: h || 0, n: n || 0 }));
     for (const p of patches) seen.add(p.x + "," + p.y + "," + p.c);
     grayPatches = (s.grayPatches || []).map(([x, y, c, h, n]) => ({ x: BigInt(x), y: BigInt(y), c, h: h || 0, n: n || 0 }));
     for (const p of grayPatches) graySeen.add(p.x + "," + p.y + "," + p.c);
     rebuildHeat();
-    $("#pen").value = penC; $("#penRange").value = clampN(penC, 10, 40); $("#penVal").textContent = penC;
+    $("#penVal").textContent = penC;   // setPen() below applies the progression cap and syncs the inputs
     $("#penWarn").style.display = penC > 48 ? "inline" : "none";
     $("#mScanned").textContent = keysScanned.toLocaleString("en-US");
     $("#mPatches").textContent = patches.length.toLocaleString("en-US");
@@ -1357,36 +1476,132 @@ function loadState() {
 }
 
 // ---------- shareable result card (client-side image, no backend) ----------
-async function makeCard() {
+// ---------- map snapshot ----------
+// The map on screen is two layers: #trail is a canvas (patches, void, border, markers) and can
+// be copied straight across, but the grid is a CSS background — there are no pixels to read.
+// So the grid is repainted here from the exact numbers draw() used for that frame (pitch,
+// phase, colour, clip), line for line, and the trail is laid over it. The pen square and the
+// on-map badges are DOM, not canvas, and are deliberately left out — a result, not a cursor.
+function snapshotMap(scale) {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const S = scale || window.devicePixelRatio || 1;
+  // Re-render the trail at S rather than stretching the on-screen copy: a stretched canvas is
+  // blurry, a re-rendered one is sharp at any size. The visible canvas is borrowed for one
+  // synchronous frame and put back by resize() before anything can paint it.
+  trail.width = Math.round(w * S); trail.height = Math.round(h * S);
+  tctx.setTransform(S, 0, 0, S, 0, 0);
+  exportScale = S; exportClean = true;
+  try { draw(); } finally { exportScale = 0; exportClean = false; }
+
   const c = document.createElement("canvas");
-  c.width = 1200; c.height = 630;
+  c.width = trail.width; c.height = trail.height;
   const g = c.getContext("2d");
-  g.fillStyle = "#0d0f13"; g.fillRect(0, 0, 1200, 630);
-  g.fillStyle = "#f7931a"; g.beginPath(); g.arc(90, 90, 34, 0, 7); g.fill();
-  g.fillStyle = "#8b93a3"; g.font = "500 26px system-ui, sans-serif";
-  g.fillText("cuvre · keyspace map", 140, 98);
-  g.fillStyle = "#e6e9ef"; g.font = "600 120px system-ui, sans-serif";
-  g.fillText(keysScanned.toLocaleString("en-US"), 80, 300);
-  g.fillStyle = "#8b93a3"; g.font = "400 40px system-ui, sans-serif";
-  g.fillText("private keys explored — and 0 held Bitcoin", 82, 360);
-  g.fillStyle = "#f7931a"; g.font = "500 34px system-ui, sans-serif";
-  g.fillText("odds of ever finding one: ~10⁻⁴¹", 82, 470);
-  g.fillStyle = "#8b93a3"; g.font = "400 28px system-ui, sans-serif";
-  g.fillText("2²⁵⁶ keys exist. You cannot brute-force this. That's the point.", 82, 530);
-  g.drawImage(mm, 900, 90, 210, 210);
+  g.scale(S, S);
+  g.fillStyle = raw ? "#ffffff" : "#0a0c10";
+  g.fillRect(0, 0, w, h);
+  // The grid is a CSS background — no pixels to copy — so it is repainted from the exact
+  // numbers draw() used for this frame. The CSS main layer puts its 1px line at the START of
+  // each tile, the sub layer at the END of each sub period; reproduced as-is.
+  const G = lastFrame.grid, K = lastFrame.clip;
+  if (G && G.on && K && K.r > K.l && K.b > K.t && G.mainPitch > 0) {
+    g.save();
+    g.beginPath(); g.rect(K.l, K.t, K.r - K.l, K.b - K.t); g.clip();
+    const lines = (pitch, offset, color) => {
+      if (!(pitch >= 2)) return;
+      g.fillStyle = color;
+      for (let x = -G.phX + offset; x < w; x += pitch) if (x > -2) g.fillRect(Math.round(x * S) / S, 0, 1, h);
+      for (let y = -G.phY + offset; y < h; y += pitch) if (y > -2) g.fillRect(0, Math.round(y * S) / S, w, 1);
+    };
+    if (G.sub) lines(G.subPitch, G.subPitch - 1, GRID_SUB_RGBA);
+    lines(G.mainPitch, 0, rgba(gridColor, .32));
+    g.restore();
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(trail, 0, 0);
+
+  resize();                                        // on-screen canvas back to the screen DPR
+  return c;
+}
+
+// shrink a font until the text fits the width it has, instead of running off the card
+function fitFont(g, text, weight, size, maxW, family) {
+  let px = size;
+  do { g.font = weight + " " + px + "px " + family; } while (g.measureText(text).width > maxW && --px > 10);
+  return px;
+}
+
+async function makeCard() {
+  const CW = 1200, CH = 630, SANS = "Inter, system-ui, sans-serif";
+  const c = document.createElement("canvas");
+  c.width = CW; c.height = CH;
+  const g = c.getContext("2d");
+  g.fillStyle = "#0d0f13"; g.fillRect(0, 0, CW, CH);
+
+  // right half: the map exactly as it was, cover-cropped around its centre
+  const MX = 620, MY = 40, MW = 540, MH = 550, R = 18;
+  const shot = snapshotMap(Math.max(2, window.devicePixelRatio || 1));
+  const scale = Math.max(MW / shot.width, MH / shot.height);
+  const sw = MW / scale, sh = MH / scale;
+  g.save();
+  g.beginPath();
+  if (g.roundRect) g.roundRect(MX, MY, MW, MH, R); else g.rect(MX, MY, MW, MH);
+  g.clip();
+  g.drawImage(shot, (shot.width - sw) / 2, (shot.height - sh) / 2, sw, sh, MX, MY, MW, MH);
+  g.restore();
+  g.strokeStyle = "#262c38"; g.lineWidth = 2;
+  g.beginPath();
+  if (g.roundRect) g.roundRect(MX, MY, MW, MH, R); else g.rect(MX, MY, MW, MH);
+  g.stroke();
+
+  // left half: the numbers
+  const LX = 64, LW = MX - LX - 48;
+  g.fillStyle = "#f7931a"; g.beginPath(); g.arc(LX + 18, 86, 18, 0, 7); g.fill();
+  g.fillStyle = "#1a1204"; g.font = "700 22px " + SANS; g.textAlign = "center"; g.fillText("₿", LX + 18, 94);
+  g.textAlign = "left";
+  g.fillStyle = "#e6e9ef"; g.font = "600 24px " + SANS; g.fillText("Bitcoin Keyspace", LX + 48, 94);
+
+  const keys = keysScanned.toLocaleString("en-US");
+  g.fillStyle = "#e6e9ef"; fitFont(g, keys, "600", 104, LW, SANS); g.fillText(keys, LX - 4, 268);
+  g.fillStyle = "#8b93a3"; g.font = "400 30px " + SANS; g.fillText("private keys explored", LX, 314);
+
+  const stats = patches.length.toLocaleString("en-US") + " patches · " + statsFound().toLocaleString("en-US") + " flagged · 0 held Bitcoin";
+  g.fillStyle = "#e6e9ef"; fitFont(g, stats, "500", 26, LW, SANS); g.fillText(stats, LX, 388);
+
+  g.fillStyle = "#f7931a"; fitFont(g, "odds of ever finding one: ~10⁻⁴¹", "500", 30, LW, SANS);
+  g.fillText("odds of ever finding one: ~10⁻⁴¹", LX, 470);
+  g.fillStyle = "#8b93a3"; g.font = "400 22px " + SANS;
+  g.fillText("2²⁵⁶ keys exist. You cannot brute-force this.", LX, 540);
+  g.fillText("That's the point.", LX, 572);
+
   return await new Promise((res) => c.toBlob(res, "image/png"));
 }
+
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+const cardName = () => "bitcoin-keyspace-" + new Date().toISOString().slice(0, 10) + ".png";
+
+// Save as PNG is the map and nothing else — no card, no text — rendered so its long side is
+// ~4096px (never below the screen's own DPR, never above 6x, to stay inside canvas limits).
+const EXPORT_LONG_SIDE = 4096;
+$("#savePng").addEventListener("click", async () => {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const S = clampN(EXPORT_LONG_SIDE / Math.max(w, h), window.devicePixelRatio || 1, 6);
+  const c = snapshotMap(S);
+  const blob = await new Promise((res) => c.toBlob(res, "image/png"));
+  downloadBlob(blob, "bitcoin-keyspace-map-" + new Date().toISOString().slice(0, 10) + ".png");
+});
 $("#share").addEventListener("click", async () => {
   const blob = await makeCard();
-  const file = new File([blob], "cuvre-keyspace.png", { type: "image/png" });
+  const file = new File([blob], cardName(), { type: "image/png" });
   const text = `I explored ${keysScanned.toLocaleString("en-US")} Bitcoin private keys on the keyspace map and found exactly 0. Odds of a hit: ~10^-41.`;
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
     try { await navigator.share({ files: [file], text }); return; } catch (e) { /* fall through */ }
   }
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = "cuvre-keyspace.png"; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  downloadBlob(blob, cardName());
 });
 
 // ---------- go to / teleport + shareable URL position ----------
@@ -1486,11 +1701,99 @@ const BLOOM_BASE = IS_LOCAL
 let bloomReady = false, bloomRetried = false;
 worker.postMessage({ type: "loadBloom", base: BLOOM_BASE });
 
+// ---------- checkpoint + grid toggle ----------
+// "Set home" does not plant anything by itself — it arms the next click on the map, so you
+// pick the spot with the same gesture you scan with. Going home reuses the smooth approach
+// but skips the red landing marker: the white checkpoint square is already the thing to look
+// at, and two markers stacked on one key just read as a mess.
+function setHome(x, y) {
+  home = { x, y };
+  homeArmed = false;
+  syncHomeUI();
+  render();
+  scheduleSave();
+  showResetToast("checkpoint set");
+}
+function syncHomeUI() {
+  const set = $("#setHome"), go = $("#goHome");
+  set.classList.toggle("arm", homeArmed);
+  set.title = homeArmed ? "armed — click the map to plant the checkpoint (Esc cancels)"
+                        : "click, then click the map to plant a checkpoint";
+  go.disabled = !home;
+}
+$("#setHome").addEventListener("click", () => { homeArmed = !homeArmed; syncHomeUI(); });
+$("#goHome").addEventListener("click", () => { if (home) travelTo(home.x, home.y, false); });
+$("#gridToggle").addEventListener("click", () => {
+  gridOn = !gridOn;
+  $("#gridToggle").classList.toggle("on", gridOn);   // lit while the lines are showing
+  render();
+  clearTimeout(saveTimer); saveState();               // a toggle then a close should survive
+});
+// Escape disarms — see the global keydown handler below.
+
+// ---------- theme menu ----------
+// Back to a popover: one glyph in the row, the list on click. The list builds itself from
+// palettes.js, so adding a palette there is still the whole job.
+const themeMenu = $("#themeMenu");
+function buildThemeMenu() {
+  themeMenu.innerHTML = "";
+  for (const pal of PALETTES) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "theme-row" + (pal.id === paletteId ? " on" : "");
+    row.title = pal.note || pal.name;
+    const bar = document.createElement("span");
+    bar.className = "theme-bar";
+    bar.style.background = "linear-gradient(90deg," + pal.colors.join(",") + ")";
+    const label = document.createElement("span");
+    label.className = "theme-name";
+    label.textContent = pal.name;
+    row.append(bar, label);
+    row.addEventListener("click", () => { setPalette(pal.id); buildThemeMenu(); openThemeMenu(false); scheduleSave(); });
+    themeMenu.append(row);
+  }
+}
+function openThemeMenu(on) {
+  themeMenu.hidden = !on;
+  $("#themeBtn").classList.toggle("on", on);
+}
+$("#themeBtn").addEventListener("click", (e) => { e.stopPropagation(); openThemeMenu(themeMenu.hidden); });
+document.addEventListener("click", (e) => { if (!themeMenu.hidden && !themeMenu.contains(e.target)) openThemeMenu(false); });
+
+// ---------- header stats ----------
+// The sidebar already carries these, but it scrolls and it is easy to lose. Up here they are
+// always in frame. Each writer guards on "did the text actually change", because positionCursor
+// runs every frame and the DOM should not.
+let statShown = { keys: "", rate: "", found: "" };
+function setStat(name, value) {
+  if (statShown[name] === value) return;
+  statShown[name] = value;
+  const el = $("#stat" + name[0].toUpperCase() + name.slice(1));
+  if (el) el.textContent = value;
+}
+const posShown = { x: "", y: "" };
+function statsFound() {
+  let n = 0;
+  for (const p of patches) n += p.h || 0;
+  return n;
+}
+function refreshStats() {
+  setStat("keys", keysScanned.toLocaleString("en-US"));
+  setStat("found", statsFound().toLocaleString("en-US"));
+}
+
 // ---------- intro overlay ----------
-function hideIntro() { $("#intro").classList.add("hidden"); try { localStorage.setItem("cuvre-intro-seen", "1"); } catch (e) {} }
+// The stage hides the OS pointer so the pen square is the only cursor. The intro lives INSIDE
+// the stage, so it inherited that and the card felt unclickable — you were aiming blind at
+// "Explore". While an overlay is up the real pointer comes back and the pen square steps out.
+function showIntro(on) {
+  $("#intro").classList.toggle("hidden", !on);
+  stage.classList.toggle("overlay", on);
+}
+function hideIntro() { showIntro(false); try { localStorage.setItem("cuvre-intro-seen", "1"); } catch (e) {} }
 $("#introGo").addEventListener("click", hideIntro);
-$("#about").addEventListener("click", () => $("#intro").classList.remove("hidden"));
-try { if (localStorage.getItem("cuvre-intro-seen") === "1") $("#intro").classList.add("hidden"); } catch (e) {}
+$("#about").addEventListener("click", () => showIntro(true));
+try { showIntro(localStorage.getItem("cuvre-intro-seen") !== "1"); } catch (e) { showIntro(true); }
 
 window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
@@ -1501,6 +1804,7 @@ window.addEventListener("keydown", (e) => {
   else if (e.key === "+" || e.key === "=") { const [mx, my] = zoomFocus(); zoomIn(mx, my); e.preventDefault(); }
   else if (e.key === "-") { const [mx, my] = zoomFocus(); zoomOut(mx, my); e.preventDefault(); }
   else if (e.key === "h" || e.key === "H") { toggleWholeSpace(); e.preventDefault(); }
+  else if (e.key === "Escape") { if (!themeMenu.hidden) openThemeMenu(false); if (homeArmed) { homeArmed = false; syncHomeUI(); } }
 });
 
 // ---------- on-screen zoom controls ----------
@@ -1520,10 +1824,14 @@ if (hadSave) syncZoomIndex();  // land the restored cellPx on a rung of the ladd
 else {                         // first visit: open on the whole-space overview
   viewX = 0n; viewY = 0n; subX = 0; subY = 0; isWholeSpaceMode = true;
 }
+setPen(penC);                   // clamp a restored brush to what is actually unlocked, and paint the presets
+syncHomeUI();
+buildThemeMenu();
+refreshStats();
+$("#gridToggle").classList.toggle("on", gridOn);
 resize();
 if (isWholeSpaceMode) zoomFit();
 updateZoomDisplay();
 applyURLGoto();
 initCandidateDB().then(() => updateCandidateShelf());   // populate the shelf from prior sessions
 
-window.__dbg = { patches: () => patches, render };
