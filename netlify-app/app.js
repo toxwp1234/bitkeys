@@ -77,6 +77,7 @@ let lastResetTime = 0, resetPending = false;   // 1× soft / 2× (<500ms) hard r
 let heatImg = mmctx.createImageData(MM, MM);
 let keysScanned = 0;
 let mouse = { x: 40, y: 40, inside: false };
+let mp = null;                    // multiplayer, once it has loaded (see the end of the file)
 
 const kAt = (x, y) => y * W + x + 1n;
 const toMMx = (x) => Number((x * MMb) / W);
@@ -377,6 +378,7 @@ function draw() {
     tctx.strokeRect(kx1 + 0.5, ky1 + 0.5, kx2 - kx1, ky2 - ky1);
   }
   positionCursor();
+  if (mp) mp.layout();          // other players follow the camera
   updateZoomUI();
   scheduleSave();
 }
@@ -496,6 +498,7 @@ function positionCursor() {
     dot.classList.toggle("dot-void", inVoid(mx, my, keyRect()));
   }
 
+  if (mp) mp.pointerMoved();     // throttled inside; a no-op when nothing moved
   const [x, y] = cellUnder(mx, my);
   // The full key under the cursor, not a truncated one — a 256-bit number with its middle
   // cut out is not a number you can do anything with. Guarded so the DOM is not rewritten
@@ -1863,4 +1866,26 @@ if (isWholeSpaceMode) zoomFit();
 updateZoomDisplay();
 applyURLGoto();
 initCandidateDB().then(() => updateCandidateShelf());   // populate the shelf from prior sessions
+
+// ---------- multiplayer (phase 1: other players' cursors) ----------
+// Loaded on its own and last, so a missing config, a blocked CDN or a bug in there can never
+// take the map down with it. It sees the map only through these few functions.
+import("./multiplayer.js?v=1")
+  .then((m) => m.initMultiplayer({
+    stage, W, H, isLocal: IS_LOCAL,
+    cellPx: () => cellPx,
+    // the key under the pointer — or, with the mouse off the map, the key it is orbiting
+    pointer() {
+      const parked = !mouse.inside;
+      const [mx, my] = parked ? focusPoint() : [mouse.x, mouse.y];
+      const ax = (mx + subX) / cellPx, ay = (my + subY) / cellPx;
+      const ix = Math.floor(ax), iy = Math.floor(ay);
+      return { x: clampB(viewX + BigInt(ix), 0n, W - 1n), y: clampB(viewY + BigInt(iy), 0n, H - 1n),
+               fx: cellPx >= 1 ? ax - ix : 0, fy: cellPx >= 1 ? ay - iy : 0, c: penC, parked };
+    },
+    project: (x, y, fx, fy) => [(Number(x - viewX) + fx) * cellPx - subX, (Number(y - viewY) + fy) * cellPx - subY],
+    travelTo: (x, y) => travelTo(x, y, false),
+  }))
+  .then((api) => { mp = api; if (mp) mp.layout(); })
+  .catch((e) => console.warn("multiplayer failed to load:", e));
 
