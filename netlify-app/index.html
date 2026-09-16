@@ -30,14 +30,91 @@
     html,body{margin:0;height:100%}
     body{background:var(--bg);color:var(--text);font-family:var(--sans);-webkit-font-smoothing:antialiased;overflow:hidden}
     .app{display:grid;grid-template-columns:1fr 320px;grid-template-rows:auto 1fr;height:100vh}
-    header{grid-column:1/3;display:flex;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--border)}
-    .mark{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;font-size:22px;color:#1a1204;background:linear-gradient(145deg,#ffb347,var(--accent))}
-    h1{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
-    header .sub{margin:0;color:var(--muted);font-size:12px}
-    .bar{margin-left:auto;display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+    /* The header uses the page's own columns (1fr | 320px), so its edges are the edges below
+       it: the left half sits exactly over the map, the right half exactly over the sidebar.
+       Evenly spread groups (space-between) looked arbitrary because nothing lined up with
+       anything; this way the map controls end where the map ends. */
+    header{grid-column:1/3;display:grid;grid-template-columns:1fr 320px;align-items:stretch;
+      border-bottom:1px solid var(--border)}
+    .head-main{display:flex;align-items:center;gap:12px 20px;flex-wrap:wrap;min-width:0;padding:8px 14px}
+    .head-left{flex:0 0 auto;display:flex;align-items:center;gap:20px}
+    /* over the sidebar: same left border, so the sidebar's divider runs up through the header */
+    .head-right{display:flex;align-items:center;justify-content:space-between;gap:12px;
+      padding:8px 16px;border-left:1px solid var(--border)}
+    .brand{display:flex;align-items:center;gap:9px;flex:0 0 auto;text-align:right}
+    .mark{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;font-size:17px;color:#1a1204;background:linear-gradient(145deg,#ffb347,var(--accent))}
+    h1{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em;line-height:1.2}
+    header .sub{margin:0;color:var(--muted);font-size:10.5px;line-height:1.3}
+    /* live counters, on screen at all times instead of only in the sidebar */
+    .stats-row{flex:0 1 auto;min-width:0;overflow:hidden;display:flex;gap:14px;font-size:10.5px;color:var(--muted);align-items:center;white-space:nowrap;text-transform:uppercase;letter-spacing:.05em}
+    .stats-row .stat{display:flex;gap:5px;align-items:baseline}
+    .stats-row b{color:var(--accent);font-weight:600;font-family:var(--mono);font-size:12px;letter-spacing:0;text-transform:none}
+    .separator{width:1px;height:26px;background:var(--border);flex:0 0 auto}
+    .bar{flex:0 0 auto;display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+    /* scoped to the whole header, not .bar: the map group lives outside .bar, and with the
+       narrower scope its lit / armed / disabled states silently stopped applying */
+    header button{padding:6px 11px;font-size:11.5px}
+    header button:disabled{opacity:.4;cursor:not-allowed}
+    header button:disabled:hover{background:transparent;color:var(--muted);border-color:var(--border)}
+    header button.on{background:rgba(247,147,26,.14);border-color:var(--accent);color:var(--accent)}
+    /* armed: the next click on the map plants the checkpoint instead of scanning */
+    header button.arm{background:var(--accent);border-color:var(--accent);color:#1a1204;font-weight:600}
+    button.icon{width:28px;height:28px;padding:0;display:grid;place-items:center;font-size:13px;line-height:1}
+    /* every control group is a labelled column, so the row reads left to right */
+    .tools-group{display:flex;flex-direction:column;gap:3px;align-items:flex-start;position:relative}
+    .map-group{flex:0 0 auto;align-items:flex-end;margin-left:auto}
+    .map-group > label{align-self:flex-end}
+    .tools-group > label{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);white-space:nowrap}
+    .tools-group > div{display:flex;gap:4px;align-items:center}
+    .raw-toggle{display:flex;align-items:center;gap:6px;color:var(--text);font-size:11px;align-self:center;
+      white-space:nowrap;background:var(--panel2);border:1px solid var(--border);padding:6px 10px;border-radius:7px;cursor:pointer}
+    .raw-toggle:hover{border-color:#3a4454}
+    .raw-toggle input{width:auto;margin:0;accent-color:var(--accent);cursor:pointer}
+    /* These three are real actions. As plain ghosts they sat at --muted on transparent and
+       read as disabled next to the lit icons, so they get a surface and full-strength text. */
+    #rand,#clear{background:var(--panel2);color:var(--text);border-color:#39424f}
+    #rand:hover,#clear:hover{background:#232a35;border-color:var(--accent);color:var(--accent)}
+    .map-group button.icon{color:var(--text)}
+    .map-group button.icon:disabled{color:var(--muted)}
+    /* Theme picker is a popover again: one glyph in the row, the list on click. */
+    /* display:block matters — #themeMenu is a direct div child of .tools-group, which lays
+       its divs out as a flex ROW, and the palette list would sit side by side. */
+    #themeMenu{display:block;position:absolute;top:calc(100% + 6px);right:0;z-index:30;width:232px;max-height:62vh;overflow:auto;
+      background:var(--panel);border:1px solid var(--border);border-radius:11px;padding:5px;
+      box-shadow:0 14px 34px -12px rgba(0,0,0,.75)}
+    #themeMenu[hidden]{display:none}
+    .theme-row{display:flex;align-items:center;gap:9px;width:100%;padding:6px 7px;border:1px solid transparent;
+      border-radius:7px;background:transparent;color:var(--muted);font-size:12px;text-align:left}
+    .theme-row:hover{background:var(--panel2);border-color:var(--border);color:var(--text)}
+    .theme-row.on{color:var(--accent);border-color:rgba(247,147,26,.45);background:rgba(247,147,26,.08)}
+    .theme-bar{flex:0 0 58px;height:14px;border-radius:4px;border:1px solid rgba(255,255,255,.09)}
+    .theme-name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .field{display:flex;flex-direction:column;gap:4px}
     .field label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
     .field input{background:var(--panel);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:13px;padding:7px 9px;border-radius:8px;outline:none;width:74px}
+    /* pen powers of two: 1..8 -> 2^n */
+    #penPow{display:grid;grid-template-columns:repeat(8,26px);gap:2px}
+    #penPow button{width:26px;height:22px;padding:0;font-family:var(--mono);font-size:9.5px;font-weight:600;line-height:1;border-radius:4px;background:#000;border:1px solid var(--border);color:var(--muted)}
+    #penPow button:hover:not(.locked){border-color:var(--accent);color:var(--text)}
+    #penPow button.on{background:var(--accent);border-color:var(--accent);color:#000}
+    /* locked presets stay visible so you can see what is ahead of you */
+    #penPow button.locked{color:#3a4150;border-color:#1c212b;cursor:not-allowed}
+    /* the one you are working toward fills up left-to-right as you dig */
+    #penPow button.next{position:relative;overflow:hidden;color:var(--muted);border-color:#39424f}
+    #penPow button.next::before{content:"";position:absolute;left:0;top:0;bottom:0;width:var(--pg,0%);
+      background:rgba(247,147,26,.28);transition:width .25s ease}
+    #penPow button.next span{position:relative}
+    #penRange{width:92px;accent-color:var(--accent)}
+    #penRange:disabled{opacity:.35;cursor:not-allowed}
+    /* These live in .tools-group, not .field, so the .field input rule never reached them
+       and they fell back to the browser's white box. */
+    .bar input[type="text"],.bar input[type="number"]{background:var(--panel);border:1px solid var(--border);
+      color:var(--text);font-family:var(--mono);border-radius:7px;outline:none}
+    .bar input[type="text"]:focus,.bar input[type="number"]:focus{border-color:#3a4454}
+    #pen{width:66px;padding:5px 7px;font-size:11px}
+    #pen:disabled{opacity:.4;cursor:not-allowed}
+    #penQuest{display:block;font-size:8.5px;letter-spacing:.04em;color:var(--muted);margin-top:3px;font-family:var(--mono)}
+    #penQuest b{color:var(--accent);font-weight:600}
     button{background:var(--panel2);color:var(--text);border:1px solid var(--border);font-family:var(--sans);font-weight:500;font-size:13px;padding:8px 15px;border-radius:8px;cursor:pointer;transition:background .12s,border-color .12s,transform .05s}
     button:hover{background:#232a35;border-color:#3a4454}
     button:active{transform:translateY(1px)}
@@ -45,12 +122,42 @@
     button.primary:hover{background:var(--accent);filter:brightness(1.07)}
     button.ghost{background:transparent;color:var(--muted)}
     button.ghost:hover{color:var(--text);background:var(--panel)}
+    @media (max-width:1250px){
+      .stats-row{gap:10px}
+      header .sub{display:none}
+    }
+    @media (max-width:1050px){
+      .stats-row .stat:nth-child(3){display:none}
+      #posHud{font-size:8.5px;max-width:230px}
+    }
+    @media (max-width:900px){
+      .head-main{gap:10px;padding:7px 14px}   /* keep the 14px side inset: it is what lines the map group up with the zoom buttons */
+      .bar{gap:12px}
+      .tools-group{gap:2px}
+      #penPow{grid-template-columns:repeat(4,26px)}
+      .separator{display:none}
+    }
     /* stage */
-    #stage{position:relative;overflow:hidden;cursor:crosshair;user-select:none}
+    #stage{position:relative;overflow:hidden;cursor:none;user-select:none}
     #grid{position:absolute;inset:0;background-color:#0a0c10;
       background-image:linear-gradient(to right,#1a2029 1px,transparent 1px),linear-gradient(to bottom,#1a2029 1px,transparent 1px);}
     #trail{position:absolute;inset:0}
-    #cursor{position:absolute;top:0;left:0;border:2px solid var(--accent);background:rgba(247,147,26,.10);pointer-events:none;will-change:transform,width,height}
+    #cursor{position:absolute;top:0;left:0;box-sizing:border-box;border:1px solid rgba(247,147,26,.9);
+      background:rgba(247,147,26,.28);pointer-events:none;will-change:transform,width,height;z-index:2}
+    #cursor.cursor-void{border-color:rgba(139,147,163,.7);background:rgba(139,147,163,.12);border-style:dashed}
+    #cursor.cursor-park{border-style:dashed;background:transparent}
+    #dot.dot-void{background:#8b93a3;box-shadow:0 0 0 1.5px rgba(10,12,16,.9)}
+    #dot{position:absolute;top:0;left:0;width:7px;height:7px;margin:-3.5px 0 0 -3.5px;border-radius:50%;
+      background:var(--accent);box-shadow:0 0 0 1.5px rgba(10,12,16,.9),0 0 8px -1px var(--accent);
+      pointer-events:none;will-change:transform;z-index:3}
+    /* The full cursor coordinates. The stats row only had room for a truncated POS, and a
+       truncated 256-bit number is not a number. pointer-events:none — it sits over the map. */
+    #posHud{position:absolute;left:12px;top:10px;z-index:4;pointer-events:none;font-family:var(--mono);
+      font-size:9.5px;line-height:1.55;color:var(--muted);max-width:330px;word-break:break-all;
+      background:rgba(13,15,19,.55);padding:5px 8px;border-radius:7px;backdrop-filter:blur(3px)}
+    #posHud > div{display:flex;gap:6px}
+    #posHud span{color:var(--accent);flex:0 0 auto;opacity:.75}
+    #posHud b{font-weight:400;color:var(--text);min-width:0}
     .hint{position:absolute;left:14px;bottom:12px;color:var(--muted);font-size:12px;background:rgba(13,15,19,.7);padding:6px 10px;border-radius:8px;backdrop-filter:blur(4px)}
     /* on-screen zoom controls + scale indicator */
     #zoomCtl{position:absolute;right:14px;bottom:16px;display:flex;flex-direction:column;gap:6px;z-index:4}
@@ -58,7 +165,7 @@
     #zoomCtl button:hover{background:rgba(247,147,26,.16);border-color:var(--accent);color:var(--accent);box-shadow:0 0 16px -4px var(--accent)}
     #zoomCtl button:active{transform:scale(.9)}
     #zoomCtl .zc-sep{height:1px;background:var(--border);margin:3px 5px}
-    #zoomScale{position:absolute;right:14px;top:50px;width:158px;background:rgba(13,15,19,.82);border:1px solid var(--border);border-radius:10px;padding:9px 11px;backdrop-filter:blur(6px);z-index:4;font-family:var(--mono)}
+    #zoomScale{display:none;position:absolute;right:14px;top:50px;width:158px;background:rgba(13,15,19,.82);border:1px solid var(--border);border-radius:10px;padding:9px 11px;backdrop-filter:blur(6px);z-index:4;font-family:var(--mono)}
     #zoomScale .zs-top{display:flex;justify-content:space-between;align-items:baseline}
     #zoomScale .zs-top span:first-child{font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)}
     #zoomScale #zsFactor{color:var(--accent);font-weight:600;font-size:13px}
@@ -66,7 +173,13 @@
     #zoomScale #zsFill{height:100%;width:0;background:linear-gradient(90deg,var(--teal),var(--accent));box-shadow:0 0 8px rgba(247,147,26,.6);border-radius:3px;transition:width .18s ease}
     #zoomScale .zs-ends{display:flex;justify-content:space-between;font-size:7.5px;letter-spacing:.03em;color:var(--muted);text-transform:uppercase}
     #zoomScale #zsDetail{margin-top:6px;font-size:9px;color:var(--text);text-align:center;opacity:.85}
-    #intro{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,12,16,.74);backdrop-filter:blur(3px);z-index:5;padding:20px}
+    #intro{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,12,16,.74);backdrop-filter:blur(3px);z-index:5;padding:20px;cursor:auto}
+    /* #stage hides the OS pointer so only the pen square shows — but an overlay LIVES inside
+       the stage and inherits that, which left the intro / about card unclickable-feeling.
+       While one is open the pointer comes back and the pen square steps aside. */
+    #stage.overlay{cursor:auto}
+    #stage.overlay #cursor,#stage.overlay #dot{display:none}
+    #intro button,#intro a{cursor:pointer}
     #intro.hidden{display:none}
     #intro .card{max-width:460px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:24px 26px}
     #intro h2{margin:0 0 12px;font-size:19px;font-weight:600}
@@ -82,7 +195,7 @@
     .kv{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
     .kv .k{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px}
     .kv .v{font-family:var(--mono);font-size:12px;word-break:break-all}
-    #minimap{width:100%;aspect-ratio:1;display:block;background:#0a0c10;border-radius:8px;cursor:pointer}
+    .minimap-wrapper{display:none}
     .addr-list .row{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--muted);padding:3px 4px;border-radius:5px;word-break:break-all;cursor:pointer}
     .addr-list .row .ra{flex:1;min-width:0;word-break:break-all}
     .addr-list .row .dot{width:12px;height:12px;flex:none;display:grid;place-items:center;font-size:10px;line-height:1}
@@ -159,7 +272,8 @@
     .go{display:flex;gap:6px;margin-top:6px}
     .go input{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 8px;border-radius:8px;outline:none}
     .note{background:var(--panel);border-left:3px solid var(--accent);border-radius:0 8px 8px 0;padding:9px 11px;font-size:11px;color:var(--muted);line-height:1.55}
-    @media(max-width:760px){.app{grid-template-columns:1fr}aside{display:none}}
+    @media(max-width:760px){.app{grid-template-columns:1fr}aside{display:none}
+      header{grid-template-columns:1fr}.head-right{border-left:0;border-top:1px solid var(--border)}}
     /* raw HTML mode: strip the design down to plain browser defaults */
     body.raw{background:#fff;color:#000;font-family:"Times New Roman",serif}
     body.raw .mark,body.raw .note{display:none}
@@ -179,21 +293,47 @@
 <body>
   <div class="app">
     <header>
-      <div class="mark">₿</div>
-      <div>
-        <h1>keyspace map</h1>
-        <p class="sub">every Bitcoin private key that could ever exist — click to scan a patch</p>
+      <div class="head-main">
+        <div class="head-left">
+          <div class="stats-row">
+            <span class="stat">keys <b id="statKeys">0</b></span>
+            <span class="stat">rate <b id="statRate">0/s</b></span>
+            <span class="stat">found <b id="statFound">0</b></span>
+          </div>
+          <div class="separator"></div>
+        </div>
+        <div class="bar">
+          <div class="tools-group">
+            <label>patch · <span id="penVal">16</span><span id="penWarn" style="color:#e0b155;display:none"> · streams live</span></label>
+            <div id="penPow"><button type="button" data-pow="1"><span>1</span></button><button type="button" data-pow="2"><span>2</span></button><button type="button" data-pow="3"><span>3</span></button><button type="button" data-pow="4"><span>4</span></button><button type="button" data-pow="5"><span>5</span></button><button type="button" data-pow="6"><span>6</span></button><button type="button" data-pow="7"><span>7</span></button><button type="button" data-pow="8"><span>8</span></button></div>
+            <div><input id="penRange" type="range" min="1" max="110" value="16" step="1" /><input id="pen" type="number" value="16" min="2" max="1000000" step="2" /></div>
+            <div id="penQuest"></div>
+          </div>
+        </div>
+        <div class="tools-group map-group">
+          <label>map</label>
+          <div>
+            <button class="ghost icon" id="setHome" title="click, then click the map to plant a checkpoint">⌂</button>
+            <button class="ghost icon" id="goHome" title="fly back to your checkpoint" disabled>↩</button>
+            <button class="ghost icon" id="gridToggle" title="show / hide the grid lines">▦</button>
+            <button class="ghost icon" id="themeBtn" title="colour palette for the patch heat">◈</button>
+            <button class="ghost" id="rand" title="fly to a random coordinate">Random</button>
+            <button class="ghost" id="clear" title="1× soft — grays your tiles &amp; zeroes the count · 2× fast — full wipe">Reset ⟲</button>
+            <button class="ghost icon" id="about" title="what is this?">?</button>
+          </div>
+          <div id="themeMenu" hidden></div>
+        </div>
       </div>
-      <div class="bar">
-        <div class="field"><label>X axis · 2^</label><input id="ax" type="number" value="128" min="1" max="255" /></div>
-        <div class="field"><label>Y axis · 2^</label><input id="ay" type="number" value="128" min="1" max="255" /></div>
-        <div class="field" style="min-width:150px"><label>pen · <span id="penVal">16</span><span id="penWarn" style="color:#e0b155;display:none"> · streams live</span></label><input id="penRange" type="range" min="1" max="1000" value="16" step="1" /></div>
-        <div class="field"><label>exact</label><input id="pen" type="number" value="16" min="1" max="1000000" /></div>
-        <button class="primary" id="apply">Apply</button>
-        <button class="ghost" id="clear" title="1× soft — grays your tiles &amp; zeroes the count · 2× fast — full wipe">Reset ⟲</button>
-        <button class="ghost" id="rand">Random</button>
-        <button class="ghost" id="about">About</button>
-        <label class="field" style="flex-direction:row;align-items:center;gap:6px;color:var(--muted);font-size:12px"><input type="checkbox" id="raw" style="width:auto" /> Raw HTML</label>
+      <div class="head-right">
+        <label class="raw-toggle"><input type="checkbox" id="raw" /> Raw</label>
+        <div class="separator"></div>
+        <div class="brand">
+          <div>
+            <h1>Bitcoin Keyspace</h1>
+            <p class="sub">2²⁵⁶ keys · scale visualizer</p>
+          </div>
+          <div class="mark">₿</div>
+        </div>
       </div>
     </header>
 
@@ -201,7 +341,10 @@
       <div id="grid"></div>
       <canvas id="trail"></canvas>
       <div id="cursor"></div>
+      <div id="posHud"><div><span>X</span><b id="posX">0x0</b></div><div><span>Y</span><b id="posY">0x0</b></div></div>
+      <div id="dot"></div>
       <div class="hint">click = scan patch · drag = pan · scroll / buttons = zoom</div>
+      <div id="zoomLevel" style="position:absolute;right:14px;top:50px;font-size:12px;font-family:var(--mono);color:var(--text);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px);min-width:60px;text-align:right;transition:color .2s;z-index:4">1x</div>
       <div id="fpsCounter" style="position:absolute;right:14px;top:14px;font-size:11px;font-family:var(--mono);color:var(--accent);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px);min-width:60px;text-align:right">60 fps</div>
       <div id="precisionInfo" style="display:none;position:absolute;right:14px;top:50px;font-size:9px;font-family:var(--mono);color:var(--muted);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px)">cell: 0.000×</div>
       <div id="zoomScale">
@@ -269,7 +412,7 @@
       <div class="kv"><div class="k">last patch · key (hex)</div><div class="v" id="kHex">— click the map —</div></div>
       <div class="kv"><div class="k">explored of 2²⁵⁶</div><div class="v" id="kFrac">0 %</div></div>
       <div class="kv" style="padding:10px">
-        <canvas id="minimap" width="288" height="288" style="display:none"></canvas>
+        <div class="minimap-wrapper"><canvas id="minimap-heatmap" width="288" height="288"></canvas></div>
         <div class="k" style="margin-bottom:8px">location · cursor cell · scroll to zoom</div>
         <div class="v" id="loc" style="font-size:11px">x — · y —</div></div>
       <div class="kv">
@@ -285,6 +428,7 @@
       <div class="kv addr-list" id="patchBox" hidden><div class="k">wallets in patch (<span id="addrCount">0</span>) · click one to reveal its key</div>
         <div id="addrs" style="max-height:260px;overflow:auto;margin-top:4px"></div>
         <div id="picked" style="margin-top:6px;font-size:11px;color:var(--accent);word-break:break-all"></div></div>
+      <button id="savePng" style="width:100%" title="download the map itself, in high resolution — no cursor, no markers">Save as PNG</button>
       <button id="share" class="primary" style="width:100%">Share my result</button>
       <div class="note">These are real, valid Bitcoin addresses. They are all empty — a funded one is a ~10⁻⁴¹ event you will never see. This is a map for feeling the scale, not finding coins. Your progress is saved on this device.</div>
     </aside>
@@ -297,6 +441,13 @@
       <div class="go" style="margin-top:10px"><button class="primary" id="calcGo">Compute</button><button class="ghost" id="calcClose">Close</button></div>
       <div id="calcErr" style="color:#f0616d;font-size:12px;margin-top:8px"></div>
       <div id="calcOut" style="font-family:var(--mono);font-size:12px;color:var(--text);margin-top:8px;word-break:break-all"></div>
+    </div>
+  </div>
+  <div id="wipeModal" style="position:fixed;inset:0;z-index:21;display:none;align-items:center;justify-content:center;background:rgba(10,12,16,.74);backdrop-filter:blur(3px);padding:20px">
+    <div style="max-width:420px;width:100%;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:22px 24px">
+      <h2 style="margin:0 0 8px;font-size:18px;font-weight:600">Erase the whole trail?</h2>
+      <p style="margin:0 0 16px;color:var(--muted);font-size:13px;line-height:1.6">Every patch, all the gray territory you have already covered and the key count go with it. Saved candidates are cleared too. This cannot be undone.</p>
+      <div class="go" style="display:flex;gap:8px"><button class="ghost" id="wipeNo">Keep it</button><button class="primary" id="wipeYes">Erase everything</button></div>
     </div>
   </div>
   <div id="resetToast"></div>

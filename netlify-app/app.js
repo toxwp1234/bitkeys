@@ -1,5 +1,6 @@
 "use strict";
 import { dopamine } from "./dopamine.js?v=2";
+import { PALETTES, DEFAULT_PALETTE, DEFAULT_GRID, rampOf, paletteById, rgba } from "./palettes.js";
 const $ = (s) => document.querySelector(s);
 const stage = $("#stage");
 
@@ -45,7 +46,9 @@ const grid = $("#grid");
 const trail = $("#trail");
 const tctx = trail.getContext("2d");
 const cursor = $("#cursor");
-const mm = $("#minimap");
+const dot = $("#dot");
+// Offscreen heat canvas: no longer an on-screen minimap, it only feeds the share card.
+const mm = $("#minimap-heatmap");
 const mmctx = mm.getContext("2d");
 const MM = mm.width, MMb = BigInt(MM);
 const TWO256 = 2n ** 256n;
@@ -54,12 +57,16 @@ const clampB = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const clampN = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
 // ---------- state ----------
-let aX = 128n, aY = 128n;
+const aX = 128n, aY = 128n;   // the map IS the Bitcoin keyspace; there is nothing to configure
 let W = 2n ** aX, H = 2n ** aY;
-let cellPx = 28, minCell = 1.2, maxCell = 160;
+let cellPx = 28;
+let gliding = false, travelTimer = 0;   // true while a smooth approach is in flight
+let home = null, homeArmed = false;    // the checkpoint, and "the next map click plants it"
+let gridOn = true;
 let raw = false;
 let lastScan = null;
-let landing = null;   // last teleport target, drawn as a red marker
+let landing = null;        // last teleport target
+let landingStale = false;  // true once you have scanned somewhere else since landing
 let viewX = 0n, viewY = 0n, subX = 0, subY = 0;
 let penC = 16;
 let patches = [];                 // {x,y,c} solid scanned squares (current session, teal)
@@ -82,11 +89,23 @@ const shortHex = (v, head = 6, tail = 6) => {
 // position along an axis as a percentage (BigInt-safe, 4 decimals)
 const pctOf = (v, span) => (Number((v * 1000000n) / span) / 10000).toFixed(4) + "%";
 
+// The heat layer is a DATA layer: it is repainted only when a patch is added or the
+// territory is rebuilt — never on camera moves.
+function flushHeat() {
+  mmctx.putImageData(heatImg, 0, 0);
+  mmctx.globalAlpha = 0.4; mmctx.strokeStyle = "#f7931a"; mmctx.lineWidth = 1;
+  mmctx.beginPath();
+  mmctx.moveTo(MM / 2, 0); mmctx.lineTo(MM / 2, MM);
+  mmctx.moveTo(0, MM / 2); mmctx.lineTo(MM, MM / 2);
+  mmctx.stroke(); mmctx.globalAlpha = 1;
+}
+
 function fillHeatBg() {
   const d = heatImg.data;
   for (let i = 0; i < d.length; i += 4) { d[i] = 10; d[i + 1] = 12; d[i + 2] = 16; d[i + 3] = 255; }
 }
 fillHeatBg();
+flushHeat();
 
 function resize() {
   const w = stage.clientWidth, h = stage.clientHeight;
@@ -108,30 +127,112 @@ function normalize() {
     n = Math.floor(subY / cellPx);
     if (n) { subY -= n * cellPx; viewY += BigInt(n); }
   } else {                                            // deep zoom-out — sub-cell precision is invisible
-    if (subX) { viewX += BigInt(Math.round(subX / cellPx)); subX = 0; }
-    if (subY) { viewY += BigInt(Math.round(subY / cellPx)); subY = 0; }
+    if (subX) { const n = BigInt(Math.round(subX / cellPx)); if (viewX + n >= 0n) { viewX += n; subX = 0; } }
+    if (subY) { const n = BigInt(Math.round(subY / cellPx)); if (viewY + n >= 0n) { viewY += n; subY = 0; } }
   }
-  if (viewX < 0n) { viewX = 0n; subX = 0; }
-  if (viewY < 0n) { viewY = 0n; subY = 0; }
-  if (viewX > W) viewX = W;
-  if (viewY > H) viewY = H;
+  // Origin/end clamp: the travel that would push past the keyspace stays in the PIXEL
+  // offset instead of being thrown away. That leftover inset is exactly the void, so it
+  // survives a pan and the elastic return has something to interpolate.
+  if (viewX < 0n) { subX += Number(viewX) * cellPx; viewX = 0n; }
+  if (viewY < 0n) { subY += Number(viewY) * cellPx; viewY = 0n; }
+  if (viewX > W) { subX += Number(viewX - W) * cellPx; viewX = W; }
+  if (viewY > H) { subY += Number(viewY - H) * cellPx; viewY = H; }
 }
 
 // ---------- rendering ----------
+// The divisions come from one STATIC pool: 2^n keys per cell. Which two of them are on
+// screen is picked by the pen, so that always:   sub < pen <= main
+// i.e. the main cell is the smallest static level the pen can fill in one stroke, and the
+// sub cell is the next one down — the slots you see filling up inside it.
+// Zoom stays continuous. When the pair would get too dense to read, BOTH levels coarsen
+// together by the same power of two, so the 2x relationship (and the sub grid) never dies.
+// MAIN is the smallest static cell the pen fits in: 2^ceil(log2(penC)).
+// SUB divides the PEN itself: s = the largest POWER OF TWO that divides penC (capped at
+// penC/2 so there is always something to see inside the main cell).
+// Power of two and a divisor of the pen, so s divides BOTH the pen and the main cell:
+//   pen 120 -> s = 8   pen = 15 cells, main = 16 cells, the gap is exactly 1 cell
+//   pen  96 -> s = 32  pen =  3 cells, main =  4 cells, gap 1 cell
+//   pen  39 -> s = 1   pen = 39 cells, main = 64 cells, gap 25 cells
+//   pen 128 -> s = 64  pen =  2 cells, main =  2 cells, no gap
+// Nothing ever divides unevenly, so no main cell ends in a ragged part-square strip —
+// that stray sliver was what looked broken at pen 39 under the old delta-factoring rule.
+// s never changes with zoom, so a stroke has the same geometry wherever you drew it.
+const GRID_MAIN_MIN_PX = 10, GRID_MAIN_SPLIT_PX = 22, GRID_SUB_MIN_PX = 4;
+let gridShift = 0, gridDiv = 1n, gridSubDiv = 0n;
+function penMainExp() { return Math.max(0, Math.ceil(Math.log2(Math.max(1, penC)))); }
+function penSubCell() {
+  let s = 1;
+  while (penC % (s * 2) === 0 && s * 2 < penC) s *= 2;
+  return s;
+}
+function gridLevels() {
+  const base = penMainExp();
+  const sub = penSubCell();
+  const at = (n) => cellPx * Math.pow(2, n);
+  // The pen cell is only the STARTING rung. From there main walks the powers of two in
+  // both directions: up when a cell drops under 10px (zoom-out stays seamless), and now
+  // also DOWN when a cell clears 22px, so zooming in keeps splitting it instead of
+  // leaving one huge square on screen. It stops splitting at the sub cell — below that
+  // the two grids would collide.
+  let j = gridShift;
+  if (base + j < 0) j = -base;                   // a smaller pen must not drag main below one key
+  while (base + j < 400 && !(at(base + j) >= GRID_MAIN_MIN_PX)) j++;
+  while (base + j - 1 >= 0 && at(base + j - 1) >= GRID_MAIN_SPLIT_PX) j--;   // down to 1 key
+  gridShift = j;
+  // Zoomed in far enough, main can end up FINER than the pen's sub cell. Then the roles
+  // swap: the bigger of the two is the structural line, the smaller is the quiet one
+  // inside it, so there are always exactly two nested grids and never an inverted pair.
+  const mainExp = base + j, subExp = Math.round(Math.log2(sub));
+  return { coarseExp: Math.max(mainExp, subExp), fineCells: Math.pow(2, Math.min(mainExp, subExp)) };
+}
+// The lattice takes its colour from the active theme too — the map should feel like one
+// thing, not a themed trail under a fixed amber cage. Rebuilt in setPalette(), not per frame.
+let gridColor = DEFAULT_GRID;
+let GRID_MAIN_IMG = "", GRID_SUB_RGBA = "", GRID_EDGE_RGBA = "";
+function buildGridColors() {
+  GRID_MAIN_IMG = "linear-gradient(to right," + rgba(gridColor, .32) + " 1px,transparent 1px)," +
+                  "linear-gradient(to bottom," + rgba(gridColor, .32) + " 1px,transparent 1px)";
+  GRID_SUB_RGBA = rgba(gridColor, .13);
+  GRID_EDGE_RGBA = rgba(gridColor, .55);
+}
+buildGridColors();
+const subImgFor = (p) => {
+  const a = Math.max(0, p - 1) + "px", b = p + "px", c = GRID_SUB_RGBA;
+  const stops = (dir) => "repeating-linear-gradient(to " + dir +
+    ",transparent 0,transparent " + a + "," + c + " " + a + "," + c + " " + b + ")";
+  return stops("right") + "," + stops("bottom");
+};
+let gridImg = "";
+const lastFrame = { grid: null, clip: null };
+// While an image is being rendered: exportScale replaces the screen DPR (so edges snap to the
+// export's own pixels), and exportClean hides everything that is UI rather than map — the
+// home checkpoint, the landing marker, the dashed in-flight outline.
+let exportScale = 0, exportClean = false;   // what draw() last put on screen — read by snapshotMap()
+
 let pending = false;
 let frameCount = 0, lastFpsUpdate = 0, currentFps = 60;
+// This renderer is event-driven: it draws when something moves and stays idle otherwise.
+// Counting draws per second therefore measures HOW MUCH HAPPENED, not how fast the app is
+// — a still map legitimately reports single digits. So only report while frames are
+// actually being produced, and measure the busiest recent second rather than the last one.
+let fpsIdleSince = 0;
 function updateFps(now) {
-  if (now - lastFpsUpdate >= 1000) {
-    currentFps = frameCount;
-    frameCount = 0;
-    lastFpsUpdate = now;
-    const fpsEl = $("#fpsCounter");
-    if (fpsEl) {
-      const color = currentFps >= 50 ? "var(--accent)" : currentFps >= 30 ? "#e0b155" : "#f0616d";
-      fpsEl.style.color = color;
-      fpsEl.textContent = currentFps + " fps";
-    }
+  if (now - lastFpsUpdate < 1000) return;
+  const el = $("#fpsCounter");
+  const span = (now - lastFpsUpdate) / 1000;
+  const rate = Math.round(frameCount / span);
+  frameCount = 0;
+  lastFpsUpdate = now;
+  if (!el) return;
+  if (rate <= 2) {                                   // nothing is moving: not a frame rate
+    if (!fpsIdleSince) fpsIdleSince = now;
+    if (now - fpsIdleSince > 900) { el.style.color = "var(--muted)"; el.textContent = "idle"; }
+    return;
   }
+  fpsIdleSince = 0;
+  currentFps = rate;
+  el.style.color = rate >= 50 ? "var(--accent)" : rate >= 30 ? "#e0b155" : "#f0616d";
+  el.textContent = rate + " fps";
 }
 function render() { if (pending) return; pending = true; requestAnimationFrame((now) => {
   frameCount++;
@@ -141,64 +242,235 @@ function render() { if (pending) return; pending = true; requestAnimationFrame((
 }); }
 
 function draw() {
-  // adaptive grid: one line per cell when zoomed in; snaps to whole patches (then groups
-  // of patches) as cells shrink, so at max zoom-out the grid reads as patch boundaries.
-  let gs = cellPx, cpl = 1;
-  if (gs < 9) { cpl = penC; gs = cpl * cellPx; while (gs < 9) { cpl *= 2; gs *= 2; } }
-  const cplB = BigInt(Math.max(1, Math.round(cpl)));
-  const phX = (Number(viewX % cplB) * cellPx + subX) % gs;
-  const phY = (Number(viewY % cplB) * cellPx + subY) % gs;
-  grid.style.backgroundSize = gs + "px " + gs + "px";
-  grid.style.backgroundPosition = (-phX) + "px " + (-phY) + "px";
+  // Two lattices. The PEN lattice is the one that matters: those are the exact squares the
+  // brush snaps into, so patches tile edge to edge and structures line up. It groups up in
+  // powers of two once a pen square would be too small to read. Under it sits the faint
+  // per-cell grid, drawn only once a single key is big enough to see.
+  const { coarseExp, fineCells } = gridLevels();
+  const mainExp = coarseExp, sub = fineCells;
+  const mainPitch = cellPx * Math.pow(2, mainExp);
+  const subPitch = cellPx * sub;
+  const dB = 2n ** BigInt(mainExp);                // both layers share the main cell's box
+  const phX = (Number(viewX % dB) * cellPx + subX) % mainPitch;
+  const phY = (Number(viewY % dB) * cellPx + subY) % mainPitch;
+  const box = mainPitch + "px " + mainPitch + "px";
+  const pos = (-phX) + "px " + (-phY) + "px";
+  const imgs = [GRID_MAIN_IMG];                    // first = painted on top
+  gridDiv = 2n ** BigInt(mainExp);
+  gridSubDiv = 0n;
+  if (!gliding && subPitch >= GRID_SUB_MIN_PX && subPitch < mainPitch) {   // gradient re-raster is the cost of a deep zoom; skip it in flight
+    imgs.push(subImgFor(subPitch));
+    gridSubDiv = BigInt(sub);
+  }
+  // Lines off: an EMPTY background-image just falls back to the stylesheet's own #grid rule,
+  // so it has to be an explicit "none". The background colour and the keyspace clip stay.
+  if (!gridOn) imgs.length = 0;
+  const sizes = [], poss = [];
+  for (let i = 0; i < imgs.length; i++) { sizes.push(box, box); poss.push(pos, pos); }
+  const img = imgs.length ? imgs.join(",") : "none";
+  lastFrame.grid = { on: imgs.length > 0, mainPitch, subPitch, phX, phY, sub: imgs.length > 1 };
+  if (img !== gridImg) { grid.style.backgroundImage = img; gridImg = img; }
+  grid.style.backgroundSize = sizes.join(",");
+  grid.style.backgroundPosition = poss.join(",");
 
   const w = stage.clientWidth, h = stage.clientHeight;
   tctx.clearRect(0, 0, w, h);
+
+  // ---- keyspace bounds ----------------------------------------------------
+  // The grid is a repeating CSS pattern, so on its own it tiles forever — including
+  // past the last key, where the cursor is already clamped. That mismatch reads as an
+  // invisible wall at max zoom-out. Compute where [0,0]..[W,H] actually lands on screen
+  // and cut everything outside it: the grid is clipped, the void is shaded, and the
+  // boundary gets a visible frame.
+  // Screen pixels are clamped to a margin around the viewport because when zoomed in,
+  // W * cellPx is ~1e40 and raw values that big make unusable CSS / canvas coords.
+  const clampPx = (v, hi) => (!Number.isFinite(v) || v > hi + 2000) ? hi + 2000 : (v < -2000 ? -2000 : v);
+  const kx1 = clampPx(-Number(viewX) * cellPx - subX, w);
+  const ky1 = clampPx(-Number(viewY) * cellPx - subY, h);
+  const kx2 = clampPx(kx1 + Number(W) * cellPx, w);
+  const ky2 = clampPx(ky1 + Number(H) * cellPx, h);
+
+  const clipL = Math.max(0, kx1), clipT = Math.max(0, ky1);
+  const clipR = Math.min(w, kx2), clipB = Math.min(h, ky2);
+  lastFrame.clip = { l: clipL, t: clipT, r: clipR, b: clipB };
+  grid.style.clipPath =
+    `polygon(${clipL}px ${clipT}px, ${clipR}px ${clipT}px, ${clipR}px ${clipB}px, ${clipL}px ${clipB}px)`;
+
+  // out-of-bounds void
+  const iy1 = Math.max(0, ky1), iy2 = Math.min(h, ky2);
+  tctx.fillStyle = raw ? "#e8e8e8" : "rgba(5,6,8,0.92)";
+  if (ky1 > 0) tctx.fillRect(0, 0, w, ky1);
+  if (ky2 < h) tctx.fillRect(0, ky2, w, h - ky2);
+  if (kx1 > 0) tctx.fillRect(0, iy1, kx1, Math.max(0, iy2 - iy1));
+  if (kx2 < w) tctx.fillRect(kx2, iy1, w - kx2, Math.max(0, iy2 - iy1));
   // Draw a patch at its TRUE size. When you're zoomed far enough out that it would be
   // smaller than a pixel it is simply not drawn — at that scale it is genuinely invisible,
   // which is the honest thing to show (no fake "painted" specks floating in empty space).
+  // Edges are snapped to whole DEVICE pixels (the canvas carries a devicePixelRatio
+  // transform, so rounding in CSS pixels is not enough). A fractional fillRect antialiases
+  // its border, and two of those meeting leave a visible seam down the join — patches that
+  // touch in key space have to touch on screen with nothing between them.
+  const dpr = exportScale || window.devicePixelRatio || 1;
+  const snap = (v) => Math.round(v * dpr) / dpr;
   function drawPatch(p) {
     const s = p.c * cellPx;
     if (s < 1) return;
     const sx = Number(p.x - viewX) * cellPx - subX;
     const sy = Number(p.y - viewY) * cellPx - subY;
     if (sx > w || sy > h || sx + s < 0 || sy + s < 0) return;
-    tctx.fillRect(sx, sy, s, s);
+    const x0 = snap(sx), y0 = snap(sy);
+    tctx.fillRect(x0, y0, Math.max(1 / dpr, snap(sx + s) - x0), Math.max(1 / dpr, snap(sy + s) - y0));
   }
+  // everything that lives in the keyspace is clipped to it, so a patch or the landing
+  // marker can never bleed into the void.
+  tctx.save();
+  tctx.beginPath();
+  tctx.rect(clipL, clipT, clipR - clipL, clipB - clipT);
+  tctx.clip();
   // territory from past (soft-reset) sessions — desaturated gray, "we've been here"
   tctx.fillStyle = raw ? "#7a7a7a" : "rgba(102,106,116,0.5)";
   for (const p of grayPatches) drawPatch(p);
-  // current session — bright teal, drawn on top
-  tctx.fillStyle = raw ? "#000000" : "#1f6f88";
-  for (const p of patches) drawPatch(p);
-  if (landing) {   // red marker: where you just teleported
+  // current session, drawn on top — tinted by how many candidates the patch turned up
+  if (raw) { tctx.fillStyle = "#000000"; for (const p of patches) drawPatch(p); }
+  else for (const p of patches) { tctx.fillStyle = patchFill(p); drawPatch(p); }
+  // The square currently under the drill: an outline only. It is not painted until the scan
+  // finishes, but a 65,536-key dig takes a while and a click with no feedback at all reads
+  // as a dead click.
+  const q = !exportClean && scanActive && pendingScan && pendingScan.pending;
+  if (q && !raw) {
+    const sz = q.c * cellPx;
+    const sx = Number(q.x - viewX) * cellPx - subX, sy = Number(q.y - viewY) * cellPx - subY;
+    if (sz >= 3 && sx <= w && sy <= h && sx + sz >= 0 && sy + sz >= 0) {
+      tctx.save();
+      tctx.setLineDash([4, 3]);
+      tctx.strokeStyle = GRID_EDGE_RGBA;
+      tctx.lineWidth = 1;
+      tctx.strokeRect(sx + 0.5, sy + 0.5, sz - 1, sz - 1);
+      tctx.restore();
+    }
+  }
+  if (home && !exportClean) {   // the checkpoint — same one-key shape as the landing marker, but white
+    const hx = Number(home.x - viewX) * cellPx - subX;
+    const hy = Number(home.y - viewY) * cellPx - subY;
+    const s = Math.max(cellPx, 10);
+    tctx.fillStyle = "rgba(255,255,255,0.22)";
+    tctx.fillRect(hx, hy, s, s);
+    tctx.strokeStyle = "#f4f7fa";
+    tctx.lineWidth = 2;
+    tctx.strokeRect(hx + 0.5, hy + 0.5, s - 1, s - 1);
+  }
+  if (landing && !exportClean) {   // where you teleported: one key, red while it is the live target
     const lx = Number(landing.x - viewX) * cellPx - subX;
     const ly = Number(landing.y - viewY) * cellPx - subY;
-    const s = Math.max(penC * cellPx, 10);
-    tctx.fillStyle = "rgba(240,97,109,0.18)"; tctx.fillRect(lx, ly, s, s);
-    tctx.strokeStyle = "#f0616d"; tctx.lineWidth = 2; tctx.strokeRect(lx + 0.5, ly + 0.5, s - 1, s - 1);
+    const s = Math.max(cellPx, 10);
+    tctx.fillStyle = landingStale ? "rgba(139,147,163,0.16)" : "rgba(240,97,109,0.18)";
+    tctx.fillRect(lx, ly, s, s);
+    tctx.strokeStyle = landingStale ? "#8b93a3" : "#f0616d";
+    tctx.lineWidth = 2;
+    tctx.strokeRect(lx + 0.5, ly + 0.5, s - 1, s - 1);
   }
-  drawMinimap();
+  tctx.restore();
+  // edge of the keyspace — the hard limit the cursor is clamped to
+  if (kx2 > kx1 && ky2 > ky1) {
+    tctx.strokeStyle = raw ? "#000000" : GRID_EDGE_RGBA;
+    tctx.lineWidth = 1.5;
+    tctx.strokeRect(kx1 + 0.5, ky1 + 0.5, kx2 - kx1, ky2 - ky1);
+  }
   positionCursor();
   updateZoomUI();
   scheduleSave();
 }
 
-function drawMinimap() {
-  mmctx.putImageData(heatImg, 0, 0);
-  const vw = stage.clientWidth / cellPx, vh = stage.clientHeight / cellPx;
-  const rx = toMMx(viewX), ry = toMMy(viewY);
-  const rw = Math.max(3, Number((BigInt(Math.ceil(vw)) * MMb) / W));
-  const rh = Math.max(3, Number((BigInt(Math.ceil(vh)) * MMb) / H));
-  mmctx.strokeStyle = "#f7931a"; mmctx.lineWidth = 1.5;
-  mmctx.strokeRect(rx + 0.5, ry + 0.5, Math.min(rw, MM), Math.min(rh, MM));
-  // static centre crosshair (drawn on the canvas — ::after doesn't render on <canvas>)
-  mmctx.globalAlpha = 0.4; mmctx.strokeStyle = "#f7931a"; mmctx.lineWidth = 1;
-  mmctx.beginPath();
-  mmctx.moveTo(MM / 2, 0); mmctx.lineTo(MM / 2, MM);
-  mmctx.moveTo(0, MM / 2); mmctx.lineTo(MM, MM / 2);
-  mmctx.stroke(); mmctx.globalAlpha = 1;
+// The one point the map orbits: where you just teleported, if it is on screen, otherwise
+// the middle of the stage. Both the zoom buttons and the parked pen use it, so zooming
+// always closes in on the thing you are looking at.
+function focusPoint() {
+  const w = stage.clientWidth || 0, h = stage.clientHeight || 0;
+  if (landing) {
+    const lx = Number(landing.x - viewX) * cellPx - subX;
+    const ly = Number(landing.y - viewY) * cellPx - subY;
+    if (Number.isFinite(lx) && Number.isFinite(ly) && lx >= 0 && ly >= 0 && lx <= w && ly <= h) return [lx, ly];
+  }
+  return [w / 2, h / 2];
 }
 
+// Centre the keyspace whenever it is smaller than the stage on that axis, so the whole
+// map always sits in the middle instead of flush against the origin.
+function centerKeyspace() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const kw = Number(W) * cellPx, kh = Number(H) * cellPx;
+  if (kw <= w) { viewX = 0n; subX = -(w - kw) / 2; }
+  if (kh <= h) { viewY = 0n; subY = -(h - kh) / 2; }
+}
+
+// ---------- candidate heat ----------
+// Every patch remembers how many of its keys the Bloom filter flagged — the ones that get
+// sent to the balance API — and the colour is driven by that COUNT, not by density.
+// Density was working against you: a big brush scans more keys, so a real find got divided
+// by a bigger area and came out paler than a lucky small patch. Count does the opposite,
+// which is the point — dig wide, turn up more, and the square says so.
+let paletteId = DEFAULT_PALETTE;
+let HEAT_RAMP = rampOf(paletteById(paletteId));
+function setPalette(id) {
+  const pal = paletteById(id);
+  paletteId = pal.id;
+  HEAT_RAMP = rampOf(pal);
+  gridColor = pal.grid || DEFAULT_GRID;
+  buildGridColors();
+  gridImg = "";                 // the background-image cache keys on the string, so drop it
+  render();
+  positionCursor();
+}
+
+// Each hit has to move the colour less than the one before it, but never so little that you
+// cannot see it. log1p does exactly that: the first find is a jump, the tenth is a nudge, and
+// nothing ever lands on the same colour twice. HEAT_FULL is where the ramp runs out — chosen
+// so the whole plausible range is spent on it (a 2^8 brush is 65,536 keys, and at the filter's
+// ~1.2e-4 false-positive rate that is ~8 candidates on an ordinary dig).
+const HEAT_FULL = 24;
+const HEAT_DENOM = Math.log1p(HEAT_FULL);
+function patchHeat(p) {
+  const h = p.h || 0;
+  return h > 0 ? clampN(Math.log1p(h) / HEAT_DENOM, 0, 1) : 0;
+}
+function patchFill(p) { return heatColor(patchHeat(p), 1); }
+function heatColor(t, alpha, lift) {
+  let i = 0;
+  while (i < HEAT_RAMP.length - 2 && t > HEAT_RAMP[i + 1][0]) i++;
+  const [t0, c0] = HEAT_RAMP[i], [t1, c1] = HEAT_RAMP[i + 1];
+  const u = t1 > t0 ? clampN((t - t0) / (t1 - t0), 0, 1) : 0;
+  const ch = (k) => {
+    const v = c0[k] + (c1[k] - c0[k]) * u;
+    return Math.round(lift ? v + (255 - v) * lift : v);
+  };
+  return "rgba(" + ch(0) + "," + ch(1) + "," + ch(2) + "," + alpha + ")";
+}
+
+// Which scanned patch is under the cursor. Cached on the snapped cell (plus the patch count,
+// so a fresh scan invalidates it) — the list is walked only when you move to a new square,
+// not on every frame.
+let hoverCell = "", hoverPatch = null;
+function patchAt(x, y) {
+  const k = x + "," + y + "," + patches.length;
+  if (k === hoverCell) return hoverPatch;
+  hoverCell = k; hoverPatch = null;
+  for (let i = patches.length - 1; i >= 0; i--) {
+    const p = patches[i], c = BigInt(p.c);
+    if (x >= p.x && x < p.x + c && y >= p.y && y < p.y + c) { hoverPatch = p; break; }
+  }
+  return hoverPatch;
+}
+
+// keyspace rect in stage pixels — the single source of truth for the void
+function keyRect() {
+  const kx1 = -Number(viewX) * cellPx - subX;
+  const ky1 = -Number(viewY) * cellPx - subY;
+  return { kx1, ky1, kx2: kx1 + Number(W) * cellPx, ky2: ky1 + Number(H) * cellPx };
+}
+const inVoid = (mx, my, k) => (mx < k.kx1 || mx > k.kx2 || my < k.ky1 || my > k.ky2);
+
+// Snaps to the SUB grid — the small squares you can actually see — so a stroke always
+// starts on a visible line, at every zoom, whatever the pen size is.
 function cellUnder(mx, my) {
   const fx = (mx + subX) / cellPx, fy = (my + subY) / cellPx;
   let x = viewX + BigInt(Math.floor(fx));
@@ -206,29 +478,59 @@ function cellUnder(mx, my) {
   const c = BigInt(penC);
   x = clampB(x, 0n, W - c > 0n ? W - c : 0n);
   y = clampB(y, 0n, H - c > 0n ? H - c : 0n);
-  return [x, y];
+  const q = BigInt(Math.max(1, penSubCell()));       // fixed by the pen, never by the zoom
+  return [(x / q) * q, (y / q) * q];                 // x,y >= 0 here, so this floors
 }
 
 function positionCursor() {
-  if (!mouse.inside) { cursor.style.display = "none"; return; }
-  cursor.style.display = "block";
-  const [x, y] = cellUnder(mouse.x, mouse.y);
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const parked = !mouse.inside;
+  const [fx, fy] = parked ? focusPoint() : [0, 0];
+  const mx = parked ? fx : mouse.x;
+  const my = parked ? fy : mouse.y;
+
+  // The pen box is hidden; the dot is the whole pointer now.
+  dot.style.display = parked ? "none" : "block";
+  if (!parked) {
+    dot.style.transform = `translate(${mouse.x}px,${mouse.y}px)`;
+    dot.classList.toggle("dot-void", inVoid(mx, my, keyRect()));
+  }
+
+  const [x, y] = cellUnder(mx, my);
+  // The full key under the cursor, not a truncated one — a 256-bit number with its middle
+  // cut out is not a number you can do anything with. Guarded so the DOM is not rewritten
+  // on every frame the cursor happens to sit still.
+  const hx = "0x" + x.toString(16), hy = "0x" + y.toString(16);
+  if (hx !== posShown.x) { posShown.x = hx; $("#posX").textContent = hx; }
+  if (hy !== posShown.y) { posShown.y = hy; $("#posY").textContent = hy; }
   const loc = $("#loc");
+  const hp = patchAt(x, y);
   loc.innerHTML =
     `X ${pctOf(x, W)} <span style="color:var(--muted)">${shortHex(x, 5, 4)}</span><br>` +
-    `Y ${pctOf(y, H)} <span style="color:var(--muted)">${shortHex(y, 5, 4)}</span>`;
+    `Y ${pctOf(y, H)} <span style="color:var(--muted)">${shortHex(y, 5, 4)}</span>` +
+    (hp ? `<br><span style="color:${heatColor(patchHeat(hp), 1, 0.3)}">■</span> ` +
+          `${hp.h.toLocaleString("en-US")} / ${(hp.c * hp.c).toLocaleString("en-US")} ` +
+          `<span style="color:var(--muted)">flagged</span>` : "");
   loc.title = "x 0x" + x.toString(16) + "\ny 0x" + y.toString(16);
 
   const precEl = $("#precisionInfo");
   if (precEl && cellPx > 0) precEl.textContent = "cell: " + (cellPx / 28).toFixed(2) + "×";
 
-  const raw0 = penC * cellPx;
-  const s = Math.max(raw0, 4);                        // stays a visible pen-marker even at overview zoom
-  const off = (raw0 - s) / 2;
-  const sx = Number(x - viewX) * cellPx - subX + off;
-  const sy = Number(y - viewY) * cellPx - subY + off;
-  cursor.style.width = s + "px"; cursor.style.height = s + "px";
-  cursor.style.transform = `translate(${sx}px,${sy}px)`;
+  // Highlight exactly the keys this click would paint: penC x penC cells at the snapped
+  // origin, drawn at TRUE size so what lights up is what gets scanned.
+  const { kx1, ky1, kx2, ky2 } = keyRect();
+  const size = Math.max(penC * cellPx, 2);
+  const px = Number(x - viewX) * cellPx - subX;
+  const py = Number(y - viewY) * cellPx - subY;
+  if (!Number.isFinite(px) || !Number.isFinite(py) || px > w || py > h || px + size < 0 || py + size < 0) {
+    cursor.style.display = "none";
+    return;
+  }
+  cursor.style.display = "block";
+  cursor.classList.toggle("cursor-void", !parked && inVoid(mx, my, { kx1, ky1, kx2, ky2 }));
+  cursor.style.width = size + "px";
+  cursor.style.height = size + "px";
+  cursor.style.transform = `translate(${px}px,${py}px)`;
 }
 
 // ---------- scanning (client-side, on click only) ----------
@@ -242,25 +544,23 @@ let scanRevealed = false;   // reveal the scan's result number ONCE, after every
 let verifyDone = false;     // fire the box-hide + completion chime exactly once per scan
 
 function scanAt(x, y) {
+  if (landing && (landing.x !== x || landing.y !== y)) landingStale = true;
   try { dopamine.initAudio(); } catch (e) {}         // unlock the AudioContext within this click gesture
   const key = x + "," + y + "," + penC;
   const k0 = kAt(x, y);
   const kh = $("#kHex");
   kh.textContent = shortHex(k0, 8, 8);
   kh.title = "0x" + k0.toString(16);
-  // paint the patch instantly (optimistic); keysScanned now ticks up as the stream checks
-  if (!seen.has(key)) {
-    seen.add(key);
-    patches.push({ x, y, c: penC });
-    const mi = (toMMy(y) * MM + toMMx(x)) * 4;
-    if (mi >= 0 && mi < heatImg.data.length) { heatImg.data[mi] = 31; heatImg.data[mi + 1] = 111; heatImg.data[mi + 2] = 136; }
-  }
-  $("#mPatches").textContent = patches.length.toLocaleString("en-US");
+  // Nothing is painted yet. The patch lands only once the scan actually finishes (see
+  // commitPatch) — clicking used to colour the square immediately, which meant you could
+  // spray the map faster than a single key could be checked and end up with territory you
+  // never scanned. A click that gets cancelled by the next click leaves no trace at all.
   render();
   // stream the WHOLE patch: pen n -> n*n keys, derived + bloom-checked in chunks, off-thread.
   // No cap — the machine goes as far/fast as it can; a new click cancels the running scan.
   const id = ++scanId;
-  pendingScan = { id, k0, W, cols: penC, total: penC * penC, checkedSoFar: 0 };
+  pendingScan = { id, k0, W, cols: penC, total: penC * penC, checkedSoFar: 0,
+                  pending: { x, y, c: penC, key } };   // becomes a real patch at scanDone
   lastScan = { k0, W, cols: penC };
   scanActive = true;
   balGen++; balBatch = { gen: balGen, total: 0, done: 0, funded: 0, failed: 0, scan: true };  // fresh balance session
@@ -563,12 +863,37 @@ worker.onmessage = (e) => {
   if (msg.type === "scanDone") {
     if (!pendingScan || msg.id !== pendingScan.id) return;
     tickChecked(msg.checked);
+    commitPatch(msg.checked, msg.foundCount);
     if (msg.display) renderPatchList(msg.display, msg.total, msg.bloomOn);
     scanActive = false;
+    render(); scheduleSave();
     finishScanUI();
     return;
   }
 };
+
+// A patch exists once its scan has run to the end — not before. It carries how many keys the
+// Bloom filter flagged (h) and how many were actually checked (n), which is what tints it.
+// A cancelled scan commits nothing, so it costs no territory and earns no dig.
+function commitPatch(checked, found) {
+  const q = pendingScan && pendingScan.pending;
+  if (!q) return;
+  pendingScan.pending = null;
+  const p = { x: q.x, y: q.y, c: q.c, h: found | 0, n: checked | 0 };
+  const old = patches.find((o) => o.c === p.c && o.x === p.x && o.y === p.y);
+  if (old) { old.h = p.h; old.n = p.n; }          // re-dug the same square: refresh, do not duplicate
+  else {
+    seen.add(q.key);
+    patches.push(p);
+    creditDig();
+    const mi = (toMMy(p.y) * MM + toMMx(p.x)) * 4;
+    if (mi >= 0 && mi < heatImg.data.length) { heatImg.data[mi] = 31; heatImg.data[mi + 1] = 111; heatImg.data[mi + 2] = 136; }
+    flushHeat();
+  }
+  $("#mPatches").textContent = patches.length.toLocaleString("en-US");
+  refreshStats();
+  render();
+}
 
 // keysScanned ticks up honestly as the stream confirms keys (never the fictional pen²)
 function tickChecked(checked) {
@@ -578,6 +903,7 @@ function tickChecked(checked) {
   keysScanned += delta;
   $("#mScanned").textContent = keysScanned.toLocaleString("en-US");
   $("#kFrac").textContent = fracExplored();
+  setStat("keys", keysScanned.toLocaleString("en-US"));
 }
 
 // on-screen sample of the scanned addresses (the stream checks far more than this)
@@ -617,17 +943,22 @@ function updateScanUI(checked, total, found, bloomOn) {
   const rate = Math.round(checked / Math.max(0.001, (performance.now() - scanT0) / 1000));
   if ($("#scanStats")) $("#scanStats").textContent = found ? found.toLocaleString("en-US") + " potential ★" : "—";
   if ($("#scanRate")) $("#scanRate").textContent = rate.toLocaleString("en-US") + "/s";
+  setStat("rate", rate.toLocaleString("en-US") + "/s");
   $("#balState").textContent = bloomOn ? "scanning patch…" : "loading filter…";
   $("#balUsd").textContent = "of " + total.toLocaleString("en-US") + " · " + rate.toLocaleString("en-US") + "/s"
     + (found ? " · " + found.toLocaleString("en-US") + " candidate" + (found > 1 ? "s" : "") + " ★" : "");
 }
 function finishScanUI() {
   $("#scanBarWrap").style.display = "none";
+  setStat("rate", "0/s");                      // idle means idle, not "whatever the last burst hit"
   if (balBatch.done >= balBatch.total) {                // every potential already resolved by scan-end
     if (balBatch.scan) finishVerification();            // hide the checking box + chime (once)
     if (!balBatch.funded && !scanRevealed) { scanRevealed = true; showBloomEmpty2(); }
   } else if (!balBatch.funded) {                        // potentials still being fetched — DON'T claim 0 BTC yet
-    $("#balState").textContent = "verifying " + (balBatch.total - balBatch.done) + " potential key(s)…";
+    // This used to print total - done, so a scan that turned up 100 candidates and had
+    // verified 87 of them announced "13 potential keys" — the backlog, read as the find.
+    $("#balState").textContent = "verifying " + balBatch.done.toLocaleString("en-US") + " / "
+      + balBatch.total.toLocaleString("en-US") + " potential keys…";
     // the honest number reveals in reportBalance the moment the last potential resolves
   }
 }
@@ -662,19 +993,51 @@ function fracExplored() {
   return pct === 0 ? "0 %" : pct.toExponential(3) + " %";
 }
 
+// ---------- elastic return: a click in the void pulls the map back ----------
+// Only subX/subY (pixel offsets) are interpolated — never viewX/viewY. normalize() folds
+// each step into the BigInt origin, so no float math ever touches a 10^38 magnitude.
+let elasticRAF = 0, elDX = 0, elDY = 0;
+function stopElastic() { if (elasticRAF) { cancelAnimationFrame(elasticRAF); elasticRAF = 0; } elDX = elDY = 0; }
+function elasticStep() {
+  elasticRAF = 0;
+  const kx = elDX * 0.22, ky = elDY * 0.22;          // lerp toward the edge
+  const sx = Math.abs(elDX) < 0.5 ? elDX : kx;
+  const sy = Math.abs(elDY) < 0.5 ? elDY : ky;
+  subX += sx; subY += sy; elDX -= sx; elDY -= sy;
+  normalize(); render();
+  if (Math.abs(elDX) >= 0.5 || Math.abs(elDY) >= 0.5) elasticRAF = requestAnimationFrame(elasticStep);
+}
+function elasticReturn() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const { kx1, ky1, kx2, ky2 } = keyRect();
+  const kw = kx2 - kx1, kh = ky2 - ky1;
+  // nearest resting place for the keyspace: flush against the edge you drifted past,
+  // or dead-centre when the whole space is smaller than the stage
+  const tx = kw <= w ? (w - kw) / 2 : (kx1 > 0 ? 0 : (kx2 < w ? w - kw : kx1));
+  const ty = kh <= h ? (h - kh) / 2 : (ky1 > 0 ? 0 : (ky2 < h ? h - kh : ky1));
+  elDX = clampN(kx1 - tx, -w, w);
+  elDY = clampN(ky1 - ty, -h, h);
+  if (!Number.isFinite(elDX) || !Number.isFinite(elDY)) { stopElastic(); return; }
+  if (Math.abs(elDX) < 0.5 && Math.abs(elDY) < 0.5) { stopElastic(); return; }
+  if (!elasticRAF) elasticRAF = requestAnimationFrame(elasticStep);
+}
+
 // ---------- interaction: hover moves cursor, drag pans, click scans ----------
 let down = false, moved = false, lx = 0, ly = 0;
 stage.addEventListener("mouseenter", () => { mouse.inside = true; });
 stage.addEventListener("mouseleave", () => { mouse.inside = false; positionCursor(); });
 stage.addEventListener("mousedown", (e) => {
   if (e.target.closest("#zoomCtl, #zoomScale")) return;   // clicks on the overlay controls aren't map scans
+  stopZoom();                                             // grabbing the map cancels any approach in flight
   down = true; moved = false; lx = e.clientX; ly = e.clientY;
 });
 window.addEventListener("mouseup", (e) => {
   if (down && !moved) {
     const r = stage.getBoundingClientRect();
-    const [x, y] = cellUnder(e.clientX - r.left, e.clientY - r.top);
-    scanAt(x, y);
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    if (inVoid(mx, my, keyRect())) elasticReturn();   // clicked the void: pull the map back
+    else if (homeArmed) { const [x, y] = cellUnder(mx, my); setHome(x, y); }
+    else { const [x, y] = cellUnder(mx, my); scanAt(x, y); }
   }
   down = false;
 });
@@ -690,49 +1053,224 @@ stage.addEventListener("mousemove", (e) => {
     positionCursor();
   }
 });
-// ---------- buttery, cursor-anchored deep-zoom ----------
-// Each notch eases cellPx toward a target instead of snapping, and rapid scrolls stack onto
-// the target — so you can spin the wheel and glide from the whole-space overview down to a
-// single pen-pixel in one smooth, satisfying motion. The cell under the cursor stays pinned.
-let zoomTarget = cellPx, zoomAnchor = null, zoomRAF = 0;
-function zoomStep() {
-  zoomRAF = 0;
-  const d = zoomTarget - cellPx;
-  cellPx += d * 0.3;                                   // ease-out toward the target
-  if (Math.abs(zoomTarget - cellPx) <= Math.max(zoomTarget * 0.01, 1e-40)) cellPx = zoomTarget;  // snap home
-  if (zoomAnchor) {                                    // keep the anchored cell under the cursor
-    viewX = zoomAnchor.ax; subX = zoomAnchor.afx * cellPx - zoomAnchor.mx;
-    viewY = zoomAnchor.ay; subY = zoomAnchor.afy * cellPx - zoomAnchor.my;
-    normalize();
+// ---------- zoom: discrete snapped levels + a separate whole-space view ----------
+// cellPx is always penC x a fixed multiplier, so a cell, the pen square and the grid
+// lattice are whole numbers of pixels at every level — nothing lands on a half pixel.
+// Below the last level the ladder ends and the map jumps to the whole-space view, where
+// the grid is sub-pixel anyway and the void / edges / elastic return take over.
+// Continuous zoom: cellPx = BASE_CELL * zoomLevel, any float. Deliberately NOT tied to
+// the pen — changing the brush must not move or rescale the map.
+const BASE_CELL = 16;
+const ZOOM_SPEED = 1.15;                 // per wheel notch
+const MAX_ZOOM = 32;
+let zoomLevel = 1.0;
+let isWholeSpaceMode = false;
+let zoomLabelShown = "";
+
+// The floor is the cell size at which the WHOLE keyspace fits — not a constant. A fixed
+// 0.001 would still leave 2^128 keys a factor of ~10^33 too wide to ever reach the edges,
+// and it would be wrong again the moment the axis size changes in the header.
+function wholeSpaceCell() {
+  // A stage narrower than its own padding would make the fit zero or negative, and a zero
+  // floor turns every zoom ratio into Infinity. Never let the usable box fall under a pixel.
+  const vw = Math.max(1, (stage.clientWidth || 800) - 40), vh = Math.max(1, (stage.clientHeight || 600) - 40);
+  const fit = Math.min(vw / Number(W), vh / Number(H));
+  return fit > 0 ? fit : Number.MIN_VALUE;
+}
+function minZoom() { return wholeSpaceCell() / BASE_CELL; }
+
+// How close an automatic approach settles — Random, Go To, and the dive out of whole space.
+// Not "one key fills the screen", but the scale of the brush you are holding: roughly eight
+// pen squares across the short side of the stage, so the framing looks the same whichever
+// preset you picked. A pen that is not one of the 1..8 presets has no scale of its own, so it
+// falls back to preset 6. The wheel is untouched — it still goes all the way in.
+const APPROACH_EXP = 6, APPROACH_SQUARES = 8;
+function approachZoom() {
+  const n = Math.log2(penC);
+  const exp = Number.isInteger(n) && n >= 1 && n <= 8 ? n : APPROACH_EXP;
+  const short = Math.min(stage.clientWidth || 800, stage.clientHeight || 600);
+  const pxPerKey = short / APPROACH_SQUARES / Math.pow(2, exp);
+  return clampN(pxPerKey / BASE_CELL, minZoom(), MAX_ZOOM);
+}
+
+function updateZoomDisplay() {
+  const el = $("#zoomLevel");
+  if (!el) return;
+  const key = (isWholeSpaceMode ? "w" : "z") + ":" + cellPx + ":" + gridDiv + ":" + gridSubDiv;
+  if (key === zoomLabelShown) return;                 // draw() calls this every frame
+  zoomLabelShown = key;
+  const head = isWholeSpaceMode ? "whole"
+    : cellPx >= 1 ? cellPx.toFixed(1) + " px" : cellPx.toPrecision(2) + " px";
+  const n = (v) => v <= 1 ? "1" : (v < 1e6 ? v.toLocaleString("en-US") : fmtBig(v));
+  const d = Number(gridDiv), sd = Number(gridSubDiv);
+  const div = n(d) + " / " + (sd ? n(sd) : "–") + (d <= 1 ? " key" : " keys");
+  el.innerHTML = head + '<div style="font-size:9px;color:var(--muted);margin-top:2px">cell · '
+               + div + "</div>";
+  el.style.color = isWholeSpaceMode ? "var(--accent)" : "var(--text)";
+  el.title = (isWholeSpaceMode ? "whole space" : "zoom " + zoomLevel.toPrecision(3) + "x") + "\n" + (cellPx >= 1
+    ? "1 key = " + (cellPx < 10 ? cellPx.toFixed(1) : Math.round(cellPx)) + " px"
+    : "1 px ≈ " + fmtBig(1 / cellPx) + " keys");
+}
+
+// ---------- smooth approach ----------
+// Not an animation in the keyframe sense: the map keeps drawing exactly what it always
+// draws, we just walk zoomLevel there instead of jumping. The walk is GEOMETRIC (each
+// frame multiplies) because that is what reads as constant speed to the eye across 35
+// orders of magnitude, and the camera centre is a BigInt lerp, so crossing 10^38 keys
+// costs the same as crossing ten.
+let glideRAF = 0;
+function stopGlide() {
+  if (glideRAF) { cancelAnimationFrame(glideRAF); glideRAF = 0; }
+  if (travelTimer) { clearTimeout(travelTimer); travelTimer = 0; }
+  gliding = false;
+}
+const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+
+function keyAtPixel(mx, my) {
+  const ax = Number.isFinite(mx) ? mx : stage.clientWidth / 2;
+  const ay = Number.isFinite(my) ? my : stage.clientHeight / 2;
+  return [clampB(viewX + BigInt(Math.floor((ax + subX) / cellPx)), 0n, W),
+          clampB(viewY + BigInt(Math.floor((ay + subY) / cellPx)), 0n, H)];
+}
+// the key you are closing in on: the landing marker if it is live, else the middle
+function focusKey() { return landing ? [landing.x, landing.y] : keyAtPixel(); }
+// No normalize() here on purpose. At whole-space zoom it folds the pixel offset back into
+// the BigInt through a float divide (subX / cellPx ~ 1e40), which keeps only 53 bits and
+// silently zeroes the bottom ~80 bits of the coordinate — that is what made every random
+// landing end in a run of zeros. viewX stays exactly the key we were given.
+function centerOnKey(cx, cy) {
+  viewX = cx; subX = -stage.clientWidth / 2;
+  viewY = cy; subY = -stage.clientHeight / 2;
+}
+function glide(o) {
+  stopGlide();
+  gliding = true;
+  const z0 = zoomLevel, z1 = clampN(o.zoom, minZoom(), MAX_ZOOM);
+  const [sx, sy] = keyAtPixel();
+  // Pulling all the way out means the keyspace CENTRE ends up in the middle of the stage,
+  // so that is what we walk toward. Holding the key you happened to be over instead leaves
+  // the map hanging off one side for the whole trip and then snapping into place on the
+  // last frame — which is the "it keeps trying to fit and can't" flicker.
+  const toWhole = z1 <= minZoom() * 1.0001;
+  const tx = o.cx !== undefined ? clampB(o.cx, 0n, W) : (toWhole ? W / 2n : sx);
+  const ty = o.cy !== undefined ? clampB(o.cy, 0n, H) : (toWhole ? H / 2n : sy);
+  const dx = Number(tx - sx), dy = Number(ty - sy);
+  const lr = Math.log(z1 / z0);
+  if (!Number.isFinite(lr)) {                      // degenerate scale: nothing to walk, just be there
+    zoomLevel = z1; cellPx = BASE_CELL * z1; isWholeSpaceMode = true;
+    centerKeyspace(); render(); updateZoomDisplay();
+    gliding = false; if (o.then) o.then(); return;
   }
+  if (Math.abs(lr) < 1e-9 && !dx && !dy) { gliding = false; if (o.then) o.then(); return; }
+  // longer trip, longer glide — but never so long that it feels like waiting
+  const ms = o.ms || clampN(280 + 70 * Math.abs(lr / Math.LN2), 300, 1300);
+  const t0 = performance.now();
+  const step = (now) => {
+    glideRAF = 0;
+    const done = now - t0 >= ms;
+    const e = easeInOut(clampN((now - t0) / ms, 0, 1));
+    zoomLevel = done ? z1 : z0 * Math.exp(lr * e);
+    cellPx = BASE_CELL * zoomLevel;
+    isWholeSpaceMode = zoomLevel <= minZoom() * 1.0001;
+    // The in-flight positions go through a float (dx is a Number), so only the LAST frame
+    // may decide where we actually are — it uses the untouched BigInt target.
+    if (done) centerOnKey(tx, ty);
+    else centerOnKey(sx + BigInt(Math.round(dx * e)), sy + BigInt(Math.round(dy * e)));
+    if (isWholeSpaceMode) centerKeyspace();
+    render(); updateZoomDisplay(); positionCursor();
+    if (!done) glideRAF = requestAnimationFrame(step);
+    else { gliding = false; if (o.then) o.then(); }
+  };
+  glideRAF = requestAnimationFrame(step);
+}
+
+// Pull all the way out first (the further in you are, the longer that takes), put the
+// marker down so you can see where you are headed, hold for a beat, then descend slowly.
+// The descent is deliberately unhurried: every frame at this scale is expensive, and a
+// long ease hides that far better than a short one.
+function travelTo(cx, cy, mark) {
+  stopZoom();
+  const lo = minZoom();
+  const out = clampN(240 + 40 * Math.abs(Math.log2(zoomLevel / lo)), 240, 900);
+  glide({ zoom: lo, ms: out, then: () => {
+    if (mark !== false) { landing = { x: cx, y: cy }; landingStale = false; }
+    render();
+    travelTimer = setTimeout(() => {              // 0.7 s to actually see the point on the whole map
+      travelTimer = 0;
+      glide({ zoom: approachZoom(), cx, cy, ms: 2600 });
+    }, 700);
+  } });
+}
+
+// While the keyspace is still WIDER than the stage there is nothing to see outside it, so a
+// zoom step must not open a void gap on one side — otherwise the map hangs off an edge for
+// the whole way out and then snaps back the moment it finally fits. Panning into the void is
+// untouched; that is a deliberate move with its own elastic return.
+function clampZoomView() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const { kx1, ky1, kx2, ky2 } = keyRect();
+  if (kx2 - kx1 > w) {
+    if (kx1 > 0) subX += kx1;
+    else if (kx2 < w) subX -= w - kx2;
+  }
+  if (ky2 - ky1 > h) {
+    if (ky1 > 0) subY += ky1;
+    else if (ky2 < h) subY -= h - ky2;
+  }
+}
+
+// Re-scale around (mx,my), keeping the key under that point pinned to the same pixel.
+function applyZoom(mx, my) {
+  stopGlide();
+  const ax = Number.isFinite(mx) ? mx : stage.clientWidth / 2;
+  const ay = Number.isFinite(my) ? my : stage.clientHeight / 2;
+  const fx = (ax + subX) / cellPx, fy = (ay + subY) / cellPx;
+  const kx = viewX + BigInt(Math.floor(fx)), ky = viewY + BigInt(Math.floor(fy));
+  const rx = fx - Math.floor(fx), ry = fy - Math.floor(fy);
+  const lo = minZoom();
+  zoomLevel = clampN(zoomLevel, lo, MAX_ZOOM);
+  cellPx = BASE_CELL * zoomLevel;
+  isWholeSpaceMode = zoomLevel <= lo * 1.0001;
+  viewX = kx; subX = rx * cellPx - ax;
+  viewY = ky; subY = ry * cellPx - ay;
+  normalize();
+  clampZoomView();       // no void gap while the map is still bigger than the stage
+  centerKeyspace();      // self-gates on "does this axis fit?" — centre it the moment it does,
+  render();              // instead of waiting for the whole-space flag and jumping one notch later
+  updateZoomDisplay();
+}
+// From whole space a single 1.15x notch is invisible — you'd need ~240 of them to see a
+// key. So the first step in out of max zoom-out is a smooth approach to 1x instead.
+function zoomIn(mx, my) {
+  if (isWholeSpaceMode) { const [cx, cy] = keyAtPixel(mx, my); glide({ zoom: approachZoom(), cx, cy }); return; }
+  zoomLevel = Math.min(MAX_ZOOM, zoomLevel * ZOOM_SPEED); applyZoom(mx, my);
+}
+function zoomOut(mx, my) { zoomLevel = Math.max(minZoom(), zoomLevel / ZOOM_SPEED); applyZoom(mx, my); }
+
+function enterWholeSpace() {
+  zoomLevel = minZoom();
+  cellPx = BASE_CELL * zoomLevel;
+  isWholeSpaceMode = true;
+  stopElastic(); stopGlide();
+  centerKeyspace();
   render();
-  if (cellPx !== zoomTarget) zoomRAF = requestAnimationFrame(zoomStep);
+  updateZoomDisplay();
 }
-function zoomBy(factor, mx, my) {
-  const fx = (mx + subX) / cellPx, fy = (my + subY) / cellPx;
-  zoomAnchor = {
-    ax: viewX + BigInt(Math.floor(fx)), afx: fx - Math.floor(fx),
-    ay: viewY + BigInt(Math.floor(fy)), afy: fy - Math.floor(fy), mx, my,
-  };
-  const base = zoomRAF ? zoomTarget : cellPx;         // stack rapid scrolls; else start from the real zoom
-  zoomTarget = clampN(base * factor, minCell, maxCell);
-  if (!zoomRAF) zoomRAF = requestAnimationFrame(zoomStep);
+function zoomFit() { enterWholeSpace(); }
+function toggleWholeSpace() {
+  if (isWholeSpaceMode) { const [cx, cy] = focusKey(); glide({ zoom: approachZoom(), cx, cy }); }
+  else glide({ zoom: minZoom() });
 }
-function stopZoom() { if (zoomRAF) { cancelAnimationFrame(zoomRAF); zoomRAF = 0; } zoomAnchor = null; zoomTarget = cellPx; }
-// animate straight to an absolute cell size (used by the max-in / max-out buttons)
-function zoomAbs(target, mx, my) {
-  const fx = (mx + subX) / cellPx, fy = (my + subY) / cellPx;
-  zoomAnchor = {
-    ax: viewX + BigInt(Math.floor(fx)), afx: fx - Math.floor(fx),
-    ay: viewY + BigInt(Math.floor(fy)), afy: fy - Math.floor(fy), mx, my,
-  };
-  zoomTarget = clampN(target, minCell, maxCell);
-  if (!zoomRAF) zoomRAF = requestAnimationFrame(zoomStep);
+// restore: derive the zoom from the saved cell size
+function syncZoomIndex() {
+  zoomLevel = clampN((cellPx > 0 ? cellPx : BASE_CELL) / BASE_CELL, minZoom(), MAX_ZOOM);
+  cellPx = BASE_CELL * zoomLevel;
+  isWholeSpaceMode = zoomLevel <= minZoom() * 1.0001;
 }
-// where the +/- buttons zoom toward: the last cursor position on the map (the pen marker)
-function zoomFocus() {
-  return [clampN(mouse.x, 0, stage.clientWidth || 0), clampN(mouse.y, 0, stage.clientHeight || 0)];
-}
+function stopZoom() { stopElastic(); stopGlide(); }
+
+// where the +/- buttons zoom toward: the landing marker, else the middle of the map
+function zoomFocus() { return focusPoint(); }
 // ---------- zoom scale indicator (how deep are we?) ----------
 const SUP = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "-": "⁻" };
 const sup = (n) => String(n).split("").map((c) => SUP[c] || c).join("");
@@ -742,49 +1280,22 @@ function fmtBig(n) {
   return (n / Math.pow(10, e)).toFixed(1) + "×10" + sup(e);
 }
 function updateZoomUI() {
-  const fill = $("#zsFill"); if (!fill) return;                 // indicator not in DOM yet
-  const lgMin = Math.log(minCell), lgMax = Math.log(maxCell);
-  let frac = (Math.log(cellPx) - lgMin) / (lgMax - lgMin);
-  frac = Math.max(0, Math.min(1, frac));
-  fill.style.width = (frac * 100).toFixed(1) + "%";
-  const fac = $("#zsFactor"); if (fac) fac.textContent = Math.round(frac * 100) + "%";
+  updateZoomDisplay();
   const det = $("#zsDetail");
   if (det) det.textContent = cellPx >= 1
     ? "1 key = " + (cellPx < 10 ? cellPx.toFixed(1) : Math.round(cellPx)) + " px"
-    : "1 px ≈ " + fmtBig(1 / cellPx) + " keys";
+    : "1 px ~ " + fmtBig(1 / cellPx) + " keys";
 }
+// Bound to the stage, not window: the sidebar (address list, candidate shelf) still scrolls.
 stage.addEventListener("wheel", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
   e.preventDefault();
   const r = stage.getBoundingClientRect();
-  zoomBy(e.deltaY < 0 ? 1.25 : 1 / 1.25, e.clientX - r.left, e.clientY - r.top);
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (e.deltaY > 0) zoomOut(mx, my); else zoomIn(mx, my);
 }, { passive: false });
 
-// ---------- minimap teleport ----------
-let mmDown = false;
-function mmJump(e) {
-  const r = mm.getBoundingClientRect();
-  const px = clampN((e.clientX - r.left) / r.width, 0, 1);
-  const py = clampN((e.clientY - r.top) / r.height, 0, 1);
-  const vw = Math.floor(stage.clientWidth / cellPx / 2), vh = Math.floor(stage.clientHeight / cellPx / 2);
-  viewX = clampB((W * BigInt(Math.round(px * MM))) / MMb - BigInt(vw), 0n, W);
-  viewY = clampB((H * BigInt(Math.round(py * MM))) / MMb - BigInt(vh), 0n, H);
-  subX = 0; subY = 0; normalize(); render();
-}
-mm.addEventListener("mousedown", (e) => { mmDown = true; mmJump(e); });
-mm.addEventListener("mousemove", (e) => { if (mmDown) mmJump(e); });
-window.addEventListener("mouseup", () => { mmDown = false; });
-
 // ---------- controls ----------
-$("#apply").addEventListener("click", () => {
-  aX = BigInt(clampN(parseInt($("#ax").value) || 128, 1, 255));
-  aY = BigInt(clampN(parseInt($("#ay").value) || 128, 1, 255));
-  W = 2n ** aX; H = 2n ** aY;
-  viewX = 0n; viewY = 0n; subX = 0; subY = 0; recomputeMinCell(); cellPx = wholeSpaceCell(); stopZoom();
-  patches = []; seen.clear(); grayPatches = []; graySeen.clear(); keysScanned = 0; fillHeatBg();
-  $("#mScanned").textContent = "0"; $("#mPatches").textContent = "0"; $("#kFrac").textContent = "0 %";
-  $("#addrs").innerHTML = ""; $("#kHex").textContent = "— click the map —";
-  setPen(parseInt($("#pen").value) || 16);
-});
 // ---------- smart reset: 1× soft (gray tiles + zero the count) · 2× fast (full wipe) ----------
 function showResetToast(msg) {
   const t = $("#resetToast"); if (!t) return;
@@ -804,58 +1315,102 @@ function handleSoftReset() {
   patches = []; seen.clear(); keysScanned = 0;
   cancelActiveWork(); resetBalCard();
   $("#mScanned").textContent = "0"; $("#mPatches").textContent = "0"; $("#kFrac").textContent = fracExplored();
+  refreshStats();
   render();
   clearTimeout(saveTimer); saveState();            // persist immediately — don't rely on the rAF-debounced save
   showResetToast("soft reset — " + grayPatches.length.toLocaleString("en-US") + " patches kept as territory");
 }
 function handleHardReset() {                       // nuclear: nothing survives
   patches = []; seen.clear(); grayPatches = []; graySeen.clear(); keysScanned = 0;
-  cancelActiveWork(); resetBalCard(); fillHeatBg();
+  cancelActiveWork(); resetBalCard(); fillHeatBg(); flushHeat();
   if (candidateDB) { try { candidateDB.transaction(CANDIDATE_STORE, "readwrite").objectStore(CANDIDATE_STORE).clear(); } catch (e) {} }
   updateCandidateShelf();
   $("#mScanned").textContent = "0"; $("#mPatches").textContent = "0"; $("#kFrac").textContent = "0 %";
+  refreshStats();
   render();
   clearTimeout(saveTimer); saveState();            // persist immediately — don't rely on the rAF-debounced save
   showResetToast("hard reset — clean slate");
 }
 function handleResetClick() {
   const now = Date.now();
-  if (resetPending && now - lastResetTime < 500) { resetPending = false; handleHardReset(); return; }
+  if (resetPending && now - lastResetTime < 500) { resetPending = false; askWipe(); return; }   // the wipe is the one step with no undo — ask first
   resetPending = true; lastResetTime = now;
   setTimeout(() => { resetPending = false; }, 500);
   handleSoftReset();
 }
 $("#clear").addEventListener("click", handleResetClick);
-// Zoom is pen-relative. Max zoom-OUT is set so a whole pen×pen patch collapses to ~2px
-// (a "pixel"); max zoom-IN keeps a single cell big. Changing the pen reframes the view so
-// one patch fills ~45% of the smaller side — the zoom always adapts to the pen.
-const PATCH_MIN_PX = 2;        // a patch at max zoom-out
-function minCellFor(pen) { return Math.max(0.02, PATCH_MIN_PX / pen); }
-// max zoom-OUT: the cell size at which the WHOLE 2^aX × 2^aY keyspace fits in the viewport.
-// This is what lets the main map replace the minimap — you can pull all the way back to the
-// entire space, then scroll in until a single pen-pixel fills the screen.
-function wholeSpaceCell() {
-  const Vw = stage.clientWidth || 800, Vh = stage.clientHeight || 600;
-  const fit = Math.min(Vw / Number(W), Vh / Number(H));
-  return fit > 0 ? fit : Number.MIN_VALUE;
-}
-function recomputeMinCell() { minCell = Math.min(minCellFor(penC), wholeSpaceCell()); }
-function penFitCell() {
-  const md = Math.min(stage.clientWidth, stage.clientHeight) || 600;
-  return clampN(md * 0.45 / penC, minCell, maxCell);
-}
+const wipeModal = $("#wipeModal");
+function askWipe() { wipeModal.style.display = "flex"; }
+function closeWipe() { wipeModal.style.display = "none"; }
+$("#wipeNo").addEventListener("click", closeWipe);
+$("#wipeYes").addEventListener("click", () => { closeWipe(); handleHardReset(); });
+wipeModal.addEventListener("click", (e) => { if (e.target === wipeModal) closeWipe(); });
+// ---------- progression: the brush is earned ----------
+// You start on 2^1. Ten fresh patches dug WITH your biggest brush unlock the next one, all the
+// way to 2^8; ten more at 2^8 unlock the slider and the exact field. Re-clicking a patch you
+// already scanned does not count — only new ground. Progression is persisted, and a reset does
+// not touch it: a reset clears the trail, not what you earned walking it.
+const PEN_START_EXP = 1, PEN_TOP_EXP = 8, DIGS_PER_UNLOCK = 10;
+let penExp = PEN_START_EXP;   // highest unlocked preset
+let penDigs = 0;              // fresh patches dug at that preset since the last unlock
+let penFree = false;          // slider + exact field earned
+const penCap = () => (penFree ? 1000000 : Math.pow(2, penExp));
+
 function setPen(v) {
-  penC = clampN(Math.round(v) || 16, 1, 1000000);      // no ceiling but a sane guard; go as big as your machine allows
+  // Pen and zoom are unrelated: the brush changes size, the map does not move or rescale.
+  penC = clampN(Math.round(v) || 16, 1, penCap());
   $("#pen").value = penC;
-  $("#penRange").value = clampN(penC, 1, 1000);
+  $("#penRange").value = clampN(penC, 1, 110);   // slider tops out at 110; the exact field is free
   $("#penVal").textContent = penC.toLocaleString("en-US");
   $("#penWarn").style.display = penC * penC > 16384 ? "inline" : "none";
-  recomputeMinCell();          // keep full zoom-out to the whole space available
-  cellPx = penFitCell();       // reframe: one patch ~45% of the view
-  stopZoom();                  // cancel any in-flight zoom animation; resync the target
+  syncPenPow();
   render();
   positionCursor();
 }
+// The 1..8 buttons are 2^n presets — lit in BTC orange only when the pen is exactly that
+// power, dimmed while still locked, and the next one fills up as you dig toward it.
+const penPowBtns = Array.from(document.querySelectorAll("#penPow button"));
+function syncPenPow() {
+  const n = Math.log2(penC), exact = Number.isInteger(n);
+  for (const b of penPowBtns) {
+    const e = Number(b.dataset.pow);
+    const locked = !penFree && e > penExp;
+    const next = !penFree && e === penExp + 1;
+    b.classList.toggle("on", exact && e === n);
+    b.classList.toggle("locked", locked);
+    b.classList.toggle("next", next);
+    b.disabled = locked;
+    b.title = locked
+      ? "locked — dig " + DIGS_PER_UNLOCK + " patches with pen " + Math.pow(2, penExp)
+      : "pen " + Math.pow(2, e);
+    if (next) b.style.setProperty("--pg", Math.round(penDigs / DIGS_PER_UNLOCK * 100) + "%");
+    else b.style.removeProperty("--pg");
+  }
+  $("#penRange").disabled = !penFree;
+  $("#pen").disabled = !penFree;
+  const q = $("#penQuest");
+  if (q) {
+    const left = DIGS_PER_UNLOCK - penDigs;
+    q.innerHTML = penFree
+      ? "every brush unlocked · slider free"
+      : "dig <b>" + left + "</b> more with pen <b>" + Math.pow(2, penExp) + "</b> → "
+        + (penExp < PEN_TOP_EXP ? "pen " + Math.pow(2, penExp + 1) : "the slider");
+  }
+}
+// called once per FRESH patch — re-digging old ground is not progress
+function creditDig() {
+  if (penFree || penC !== Math.pow(2, penExp)) return;
+  if (++penDigs < DIGS_PER_UNLOCK) { syncPenPow(); return; }
+  penDigs = 0;
+  if (penExp < PEN_TOP_EXP) { penExp++; showResetToast("pen " + Math.pow(2, penExp) + " unlocked"); }
+  else { penFree = true; showResetToast("slider unlocked — any brush size is yours"); }
+  syncPenPow();
+}
+for (const b of penPowBtns) b.addEventListener("click", () => {
+  const e = Number(b.dataset.pow);
+  if (!penFree && e > penExp) return;
+  setPen(Math.pow(2, e));
+});
 $("#pen").addEventListener("input", (e) => setPen(parseInt(e.target.value)));
 $("#penRange").addEventListener("input", (e) => setPen(parseInt(e.target.value)));
 $("#raw").addEventListener("change", (e) => { raw = e.target.checked; document.body.classList.toggle("raw", raw); render(); });
@@ -869,11 +1424,12 @@ function saveState() {
   try {
     const kept = patches.slice(-PATCH_CAP);
     localStorage.setItem(STORE, JSON.stringify({
-      aX: aX.toString(), aY: aY.toString(), penC, cellPx,
+      aX: aX.toString(), aY: aY.toString(), penC, cellPx, penExp, penDigs, penFree,
       viewX: viewX.toString(), viewY: viewY.toString(), subX, subY,
-      keysScanned,
-      patches: kept.map((p) => [p.x.toString(), p.y.toString(), p.c]),
-      grayPatches: grayPatches.slice(-PATCH_CAP).map((p) => [p.x.toString(), p.y.toString(), p.c]),
+      keysScanned, gridOn, paletteId,
+      home: home ? [home.x.toString(), home.y.toString()] : null,
+      patches: kept.map((p) => [p.x.toString(), p.y.toString(), p.c, p.h || 0, p.n || 0]),
+      grayPatches: grayPatches.slice(-PATCH_CAP).map((p) => [p.x.toString(), p.y.toString(), p.c, p.h || 0, p.n || 0]),
     }));
   } catch (e) { /* private mode / quota — ignore */ }
   updateURL();
@@ -888,24 +1444,29 @@ function rebuildHeat() {
     const mi = (toMMy(p.y) * MM + toMMx(p.x)) * 4;
     if (mi >= 0 && mi < heatImg.data.length) { heatImg.data[mi] = 31; heatImg.data[mi + 1] = 111; heatImg.data[mi + 2] = 136; }
   }
+  flushHeat();
 }
 function loadState() {
   let s;
   try { s = JSON.parse(localStorage.getItem(STORE) || "null"); } catch (e) { s = null; }
   if (!s) return false;
   try {
-    aX = BigInt(s.aX); aY = BigInt(s.aY); penC = s.penC || 16; cellPx = s.cellPx || 28;
-    W = 2n ** aX; H = 2n ** aY;
+    penExp = clampN(s.penExp | 0 || PEN_START_EXP, PEN_START_EXP, PEN_TOP_EXP);
+    penDigs = clampN(s.penDigs | 0, 0, DIGS_PER_UNLOCK - 1);
+    penFree = !!s.penFree;
+    penC = s.penC || 16; cellPx = s.cellPx || 28;   // axes are fixed; an old save's aX/aY is ignored
     viewX = BigInt(s.viewX || "0"); viewY = BigInt(s.viewY || "0");
     subX = s.subX || 0; subY = s.subY || 0;
     keysScanned = s.keysScanned || 0;
-    patches = (s.patches || []).map(([x, y, c]) => ({ x: BigInt(x), y: BigInt(y), c }));
+    gridOn = s.gridOn !== false;
+    setPalette(s.paletteId || DEFAULT_PALETTE);
+    home = s.home ? { x: BigInt(s.home[0]), y: BigInt(s.home[1]) } : null;
+    patches = (s.patches || []).map(([x, y, c, h, n]) => ({ x: BigInt(x), y: BigInt(y), c, h: h || 0, n: n || 0 }));
     for (const p of patches) seen.add(p.x + "," + p.y + "," + p.c);
-    grayPatches = (s.grayPatches || []).map(([x, y, c]) => ({ x: BigInt(x), y: BigInt(y), c }));
+    grayPatches = (s.grayPatches || []).map(([x, y, c, h, n]) => ({ x: BigInt(x), y: BigInt(y), c, h: h || 0, n: n || 0 }));
     for (const p of grayPatches) graySeen.add(p.x + "," + p.y + "," + p.c);
     rebuildHeat();
-    $("#ax").value = aX.toString(); $("#ay").value = aY.toString();
-    $("#pen").value = penC; $("#penRange").value = clampN(penC, 10, 40); $("#penVal").textContent = penC;
+    $("#penVal").textContent = penC;   // setPen() below applies the progression cap and syncs the inputs
     $("#penWarn").style.display = penC > 48 ? "inline" : "none";
     $("#mScanned").textContent = keysScanned.toLocaleString("en-US");
     $("#mPatches").textContent = patches.length.toLocaleString("en-US");
@@ -915,36 +1476,132 @@ function loadState() {
 }
 
 // ---------- shareable result card (client-side image, no backend) ----------
-async function makeCard() {
+// ---------- map snapshot ----------
+// The map on screen is two layers: #trail is a canvas (patches, void, border, markers) and can
+// be copied straight across, but the grid is a CSS background — there are no pixels to read.
+// So the grid is repainted here from the exact numbers draw() used for that frame (pitch,
+// phase, colour, clip), line for line, and the trail is laid over it. The pen square and the
+// on-map badges are DOM, not canvas, and are deliberately left out — a result, not a cursor.
+function snapshotMap(scale) {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const S = scale || window.devicePixelRatio || 1;
+  // Re-render the trail at S rather than stretching the on-screen copy: a stretched canvas is
+  // blurry, a re-rendered one is sharp at any size. The visible canvas is borrowed for one
+  // synchronous frame and put back by resize() before anything can paint it.
+  trail.width = Math.round(w * S); trail.height = Math.round(h * S);
+  tctx.setTransform(S, 0, 0, S, 0, 0);
+  exportScale = S; exportClean = true;
+  try { draw(); } finally { exportScale = 0; exportClean = false; }
+
   const c = document.createElement("canvas");
-  c.width = 1200; c.height = 630;
+  c.width = trail.width; c.height = trail.height;
   const g = c.getContext("2d");
-  g.fillStyle = "#0d0f13"; g.fillRect(0, 0, 1200, 630);
-  g.fillStyle = "#f7931a"; g.beginPath(); g.arc(90, 90, 34, 0, 7); g.fill();
-  g.fillStyle = "#8b93a3"; g.font = "500 26px system-ui, sans-serif";
-  g.fillText("cuvre · keyspace map", 140, 98);
-  g.fillStyle = "#e6e9ef"; g.font = "600 120px system-ui, sans-serif";
-  g.fillText(keysScanned.toLocaleString("en-US"), 80, 300);
-  g.fillStyle = "#8b93a3"; g.font = "400 40px system-ui, sans-serif";
-  g.fillText("private keys explored — and 0 held Bitcoin", 82, 360);
-  g.fillStyle = "#f7931a"; g.font = "500 34px system-ui, sans-serif";
-  g.fillText("odds of ever finding one: ~10⁻⁴¹", 82, 470);
-  g.fillStyle = "#8b93a3"; g.font = "400 28px system-ui, sans-serif";
-  g.fillText("2²⁵⁶ keys exist. You cannot brute-force this. That's the point.", 82, 530);
-  g.drawImage(mm, 900, 90, 210, 210);
+  g.scale(S, S);
+  g.fillStyle = raw ? "#ffffff" : "#0a0c10";
+  g.fillRect(0, 0, w, h);
+  // The grid is a CSS background — no pixels to copy — so it is repainted from the exact
+  // numbers draw() used for this frame. The CSS main layer puts its 1px line at the START of
+  // each tile, the sub layer at the END of each sub period; reproduced as-is.
+  const G = lastFrame.grid, K = lastFrame.clip;
+  if (G && G.on && K && K.r > K.l && K.b > K.t && G.mainPitch > 0) {
+    g.save();
+    g.beginPath(); g.rect(K.l, K.t, K.r - K.l, K.b - K.t); g.clip();
+    const lines = (pitch, offset, color) => {
+      if (!(pitch >= 2)) return;
+      g.fillStyle = color;
+      for (let x = -G.phX + offset; x < w; x += pitch) if (x > -2) g.fillRect(Math.round(x * S) / S, 0, 1, h);
+      for (let y = -G.phY + offset; y < h; y += pitch) if (y > -2) g.fillRect(0, Math.round(y * S) / S, w, 1);
+    };
+    if (G.sub) lines(G.subPitch, G.subPitch - 1, GRID_SUB_RGBA);
+    lines(G.mainPitch, 0, rgba(gridColor, .32));
+    g.restore();
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(trail, 0, 0);
+
+  resize();                                        // on-screen canvas back to the screen DPR
+  return c;
+}
+
+// shrink a font until the text fits the width it has, instead of running off the card
+function fitFont(g, text, weight, size, maxW, family) {
+  let px = size;
+  do { g.font = weight + " " + px + "px " + family; } while (g.measureText(text).width > maxW && --px > 10);
+  return px;
+}
+
+async function makeCard() {
+  const CW = 1200, CH = 630, SANS = "Inter, system-ui, sans-serif";
+  const c = document.createElement("canvas");
+  c.width = CW; c.height = CH;
+  const g = c.getContext("2d");
+  g.fillStyle = "#0d0f13"; g.fillRect(0, 0, CW, CH);
+
+  // right half: the map exactly as it was, cover-cropped around its centre
+  const MX = 620, MY = 40, MW = 540, MH = 550, R = 18;
+  const shot = snapshotMap(Math.max(2, window.devicePixelRatio || 1));
+  const scale = Math.max(MW / shot.width, MH / shot.height);
+  const sw = MW / scale, sh = MH / scale;
+  g.save();
+  g.beginPath();
+  if (g.roundRect) g.roundRect(MX, MY, MW, MH, R); else g.rect(MX, MY, MW, MH);
+  g.clip();
+  g.drawImage(shot, (shot.width - sw) / 2, (shot.height - sh) / 2, sw, sh, MX, MY, MW, MH);
+  g.restore();
+  g.strokeStyle = "#262c38"; g.lineWidth = 2;
+  g.beginPath();
+  if (g.roundRect) g.roundRect(MX, MY, MW, MH, R); else g.rect(MX, MY, MW, MH);
+  g.stroke();
+
+  // left half: the numbers
+  const LX = 64, LW = MX - LX - 48;
+  g.fillStyle = "#f7931a"; g.beginPath(); g.arc(LX + 18, 86, 18, 0, 7); g.fill();
+  g.fillStyle = "#1a1204"; g.font = "700 22px " + SANS; g.textAlign = "center"; g.fillText("₿", LX + 18, 94);
+  g.textAlign = "left";
+  g.fillStyle = "#e6e9ef"; g.font = "600 24px " + SANS; g.fillText("Bitcoin Keyspace", LX + 48, 94);
+
+  const keys = keysScanned.toLocaleString("en-US");
+  g.fillStyle = "#e6e9ef"; fitFont(g, keys, "600", 104, LW, SANS); g.fillText(keys, LX - 4, 268);
+  g.fillStyle = "#8b93a3"; g.font = "400 30px " + SANS; g.fillText("private keys explored", LX, 314);
+
+  const stats = patches.length.toLocaleString("en-US") + " patches · " + statsFound().toLocaleString("en-US") + " flagged · 0 held Bitcoin";
+  g.fillStyle = "#e6e9ef"; fitFont(g, stats, "500", 26, LW, SANS); g.fillText(stats, LX, 388);
+
+  g.fillStyle = "#f7931a"; fitFont(g, "odds of ever finding one: ~10⁻⁴¹", "500", 30, LW, SANS);
+  g.fillText("odds of ever finding one: ~10⁻⁴¹", LX, 470);
+  g.fillStyle = "#8b93a3"; g.font = "400 22px " + SANS;
+  g.fillText("2²⁵⁶ keys exist. You cannot brute-force this.", LX, 540);
+  g.fillText("That's the point.", LX, 572);
+
   return await new Promise((res) => c.toBlob(res, "image/png"));
 }
+
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+const cardName = () => "bitcoin-keyspace-" + new Date().toISOString().slice(0, 10) + ".png";
+
+// Save as PNG is the map and nothing else — no card, no text — rendered so its long side is
+// ~4096px (never below the screen's own DPR, never above 6x, to stay inside canvas limits).
+const EXPORT_LONG_SIDE = 4096;
+$("#savePng").addEventListener("click", async () => {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const S = clampN(EXPORT_LONG_SIDE / Math.max(w, h), window.devicePixelRatio || 1, 6);
+  const c = snapshotMap(S);
+  const blob = await new Promise((res) => c.toBlob(res, "image/png"));
+  downloadBlob(blob, "bitcoin-keyspace-map-" + new Date().toISOString().slice(0, 10) + ".png");
+});
 $("#share").addEventListener("click", async () => {
   const blob = await makeCard();
-  const file = new File([blob], "cuvre-keyspace.png", { type: "image/png" });
+  const file = new File([blob], cardName(), { type: "image/png" });
   const text = `I explored ${keysScanned.toLocaleString("en-US")} Bitcoin private keys on the keyspace map and found exactly 0. Odds of a hit: ~10^-41.`;
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
     try { await navigator.share({ files: [file], text }); return; } catch (e) { /* fall through */ }
   }
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = "cuvre-keyspace.png"; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  downloadBlob(blob, cardName());
 });
 
 // ---------- go to / teleport + shareable URL position ----------
@@ -956,7 +1613,8 @@ function goTo(cx, cy) {
   viewX = clampB(cx - BigInt(vc), 0n, W);
   viewY = clampB(cy - BigInt(vr), 0n, H);
   landing = { x: cx, y: cy };
-  subX = 0; subY = 0; normalize(); render();
+  landingStale = false;
+  subX = 0; subY = 0; normalize(); centerKeyspace(); render();
 }
 function updateURL() {
   try {
@@ -980,7 +1638,9 @@ function randBig(maxExclusive) {
   let v = 0n; for (const b of arr) v = (v << 8n) + BigInt(b);
   return v % maxExclusive;
 }
-$("#rand").addEventListener("click", () => goTo(randBig(W), randBig(H)));
+// Random is a trip, not a teleport. It keeps whatever brush you are holding — the pen is what
+// decides how close the trip ends, so resetting it here would make every landing look the same.
+$("#rand").addEventListener("click", () => { travelTo(randBig(W), randBig(H)); });
 // parse a value in the chosen base (auto understands 0x / 0b / decimal)
 function parseVal(str, base) {
   str = (str || "").trim(); if (!str) return null;
@@ -997,14 +1657,14 @@ $("#goxy").addEventListener("click", () => {
   if (x === null || y === null) return goErr("Invalid number for base “" + b + "”.");
   if (x < 0n || x >= W) return goErr("x out of range (0 … 2^" + aX + " − 1).");
   if (y < 0n || y >= H) return goErr("y out of range (0 … 2^" + aY + " − 1).");
-  goErr(""); goTo(x, y);
+  goErr(""); travelTo(x, y);
 });
 $("#gok").addEventListener("click", () => {
   const b = $("#base").value;
   const k = parseVal($("#gk").value, b), max = W * H;
   if (k === null) return goErr("Invalid key for base “" + b + "”.");
   if (k < 1n || k > max) return goErr("Key out of range (1 … 2^" + (aX + aY) + ").");
-  goErr(""); const i = k - 1n; goTo(i % W, i / W);
+  goErr(""); const i = k - 1n; travelTo(i % W, i / W);
 });
 
 // ---------- key -> address modal ----------
@@ -1041,11 +1701,99 @@ const BLOOM_BASE = IS_LOCAL
 let bloomReady = false, bloomRetried = false;
 worker.postMessage({ type: "loadBloom", base: BLOOM_BASE });
 
+// ---------- checkpoint + grid toggle ----------
+// "Set home" does not plant anything by itself — it arms the next click on the map, so you
+// pick the spot with the same gesture you scan with. Going home reuses the smooth approach
+// but skips the red landing marker: the white checkpoint square is already the thing to look
+// at, and two markers stacked on one key just read as a mess.
+function setHome(x, y) {
+  home = { x, y };
+  homeArmed = false;
+  syncHomeUI();
+  render();
+  scheduleSave();
+  showResetToast("checkpoint set");
+}
+function syncHomeUI() {
+  const set = $("#setHome"), go = $("#goHome");
+  set.classList.toggle("arm", homeArmed);
+  set.title = homeArmed ? "armed — click the map to plant the checkpoint (Esc cancels)"
+                        : "click, then click the map to plant a checkpoint";
+  go.disabled = !home;
+}
+$("#setHome").addEventListener("click", () => { homeArmed = !homeArmed; syncHomeUI(); });
+$("#goHome").addEventListener("click", () => { if (home) travelTo(home.x, home.y, false); });
+$("#gridToggle").addEventListener("click", () => {
+  gridOn = !gridOn;
+  $("#gridToggle").classList.toggle("on", gridOn);   // lit while the lines are showing
+  render();
+  clearTimeout(saveTimer); saveState();               // a toggle then a close should survive
+});
+// Escape disarms — see the global keydown handler below.
+
+// ---------- theme menu ----------
+// Back to a popover: one glyph in the row, the list on click. The list builds itself from
+// palettes.js, so adding a palette there is still the whole job.
+const themeMenu = $("#themeMenu");
+function buildThemeMenu() {
+  themeMenu.innerHTML = "";
+  for (const pal of PALETTES) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "theme-row" + (pal.id === paletteId ? " on" : "");
+    row.title = pal.note || pal.name;
+    const bar = document.createElement("span");
+    bar.className = "theme-bar";
+    bar.style.background = "linear-gradient(90deg," + pal.colors.join(",") + ")";
+    const label = document.createElement("span");
+    label.className = "theme-name";
+    label.textContent = pal.name;
+    row.append(bar, label);
+    row.addEventListener("click", () => { setPalette(pal.id); buildThemeMenu(); openThemeMenu(false); scheduleSave(); });
+    themeMenu.append(row);
+  }
+}
+function openThemeMenu(on) {
+  themeMenu.hidden = !on;
+  $("#themeBtn").classList.toggle("on", on);
+}
+$("#themeBtn").addEventListener("click", (e) => { e.stopPropagation(); openThemeMenu(themeMenu.hidden); });
+document.addEventListener("click", (e) => { if (!themeMenu.hidden && !themeMenu.contains(e.target)) openThemeMenu(false); });
+
+// ---------- header stats ----------
+// The sidebar already carries these, but it scrolls and it is easy to lose. Up here they are
+// always in frame. Each writer guards on "did the text actually change", because positionCursor
+// runs every frame and the DOM should not.
+let statShown = { keys: "", rate: "", found: "" };
+function setStat(name, value) {
+  if (statShown[name] === value) return;
+  statShown[name] = value;
+  const el = $("#stat" + name[0].toUpperCase() + name.slice(1));
+  if (el) el.textContent = value;
+}
+const posShown = { x: "", y: "" };
+function statsFound() {
+  let n = 0;
+  for (const p of patches) n += p.h || 0;
+  return n;
+}
+function refreshStats() {
+  setStat("keys", keysScanned.toLocaleString("en-US"));
+  setStat("found", statsFound().toLocaleString("en-US"));
+}
+
 // ---------- intro overlay ----------
-function hideIntro() { $("#intro").classList.add("hidden"); try { localStorage.setItem("cuvre-intro-seen", "1"); } catch (e) {} }
+// The stage hides the OS pointer so the pen square is the only cursor. The intro lives INSIDE
+// the stage, so it inherited that and the card felt unclickable — you were aiming blind at
+// "Explore". While an overlay is up the real pointer comes back and the pen square steps out.
+function showIntro(on) {
+  $("#intro").classList.toggle("hidden", !on);
+  stage.classList.toggle("overlay", on);
+}
+function hideIntro() { showIntro(false); try { localStorage.setItem("cuvre-intro-seen", "1"); } catch (e) {} }
 $("#introGo").addEventListener("click", hideIntro);
-$("#about").addEventListener("click", () => $("#intro").classList.remove("hidden"));
-try { if (localStorage.getItem("cuvre-intro-seen") === "1") $("#intro").classList.add("hidden"); } catch (e) {}
+$("#about").addEventListener("click", () => showIntro(true));
+try { showIntro(localStorage.getItem("cuvre-intro-seen") !== "1"); } catch (e) { showIntro(true); }
 
 window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
@@ -1053,30 +1801,37 @@ window.addEventListener("keydown", (e) => {
   else if (e.key === "ArrowDown" || e.key === "s") { subY -= cellPx; normalize(); render(); e.preventDefault(); }
   else if (e.key === "ArrowLeft" || e.key === "a") { subX += cellPx; normalize(); render(); e.preventDefault(); }
   else if (e.key === "ArrowRight" || e.key === "d") { subX -= cellPx; normalize(); render(); e.preventDefault(); }
-  else if (e.key === "+" || e.key === "=") { zoomBy(1.25, stage.clientWidth / 2, stage.clientHeight / 2); e.preventDefault(); }
-  else if (e.key === "-") { zoomBy(1 / 1.25, stage.clientWidth / 2, stage.clientHeight / 2); e.preventDefault(); }
+  else if (e.key === "+" || e.key === "=") { const [mx, my] = zoomFocus(); zoomIn(mx, my); e.preventDefault(); }
+  else if (e.key === "-") { const [mx, my] = zoomFocus(); zoomOut(mx, my); e.preventDefault(); }
+  else if (e.key === "h" || e.key === "H") { toggleWholeSpace(); e.preventDefault(); }
+  else if (e.key === "Escape") { if (!themeMenu.hidden) openThemeMenu(false); if (homeArmed) { homeArmed = false; syncHomeUI(); } }
 });
 
 // ---------- on-screen zoom controls ----------
-$("#zIn").addEventListener("click", () => { const [mx, my] = zoomFocus(); zoomBy(1.5, mx, my); });
-$("#zOut").addEventListener("click", () => { const [mx, my] = zoomFocus(); zoomBy(1 / 1.5, mx, my); });
-$("#zMax").addEventListener("click", () => { const [mx, my] = zoomFocus(); zoomAbs(maxCell, mx, my); });   // deepest zoom-in
-$("#zFit").addEventListener("click", () => {          // whole space, framed cleanly from the origin
-  stopZoom(); viewX = 0n; viewY = 0n; subX = 0; subY = 0;
-  zoomAbs(minCell, 0, 0);
-});
+$("#zIn").addEventListener("click", () => { const [mx, my] = zoomFocus(); zoomIn(mx, my); });
+$("#zOut").addEventListener("click", () => { const [mx, my] = zoomFocus(); zoomOut(mx, my); });
+$("#zMax").addEventListener("click", () => { const [mx, my] = zoomFocus(); zoomLevel = MAX_ZOOM; applyZoom(mx, my); });
+$("#zFit").addEventListener("click", toggleWholeSpace);   // whole space <-> 1x
 
 $("#clearShelf").addEventListener("click", () => {
   if (!candidateDB) return;
   try { candidateDB.transaction(CANDIDATE_STORE, "readwrite").objectStore(CANDIDATE_STORE).clear(); updateCandidateShelf(); } catch (e) {}
 });
 
-window.addEventListener("resize", () => { recomputeMinCell(); resize(); });
+window.addEventListener("resize", () => { if (isWholeSpaceMode) zoomFit(); resize(); });
 const hadSave = loadState();
-recomputeMinCell();           // allow zooming all the way out to the whole keyspace
-if (!hadSave) {               // first visit: open on the whole-space overview, like the old minimap
-  viewX = 0n; viewY = 0n; subX = 0; subY = 0; cellPx = wholeSpaceCell();
+if (hadSave) syncZoomIndex();  // land the restored cellPx on a rung of the ladder
+else {                         // first visit: open on the whole-space overview
+  viewX = 0n; viewY = 0n; subX = 0; subY = 0; isWholeSpaceMode = true;
 }
+setPen(penC);                   // clamp a restored brush to what is actually unlocked, and paint the presets
+syncHomeUI();
+buildThemeMenu();
+refreshStats();
+$("#gridToggle").classList.toggle("on", gridOn);
 resize();
+if (isWholeSpaceMode) zoomFit();
+updateZoomDisplay();
 applyURLGoto();
 initCandidateDB().then(() => updateCandidateShelf());   // populate the shelf from prior sessions
+
