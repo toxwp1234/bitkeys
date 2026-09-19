@@ -214,35 +214,33 @@ const lastFrame = { grid: null, clip: null };
 let exportScale = 0, exportClean = false;   // what draw() last put on screen — read by snapshotMap()
 
 let pending = false;
-let frameCount = 0, lastFpsUpdate = 0, currentFps = 60;
-// This renderer is event-driven: it draws when something moves and stays idle otherwise.
-// Counting draws per second therefore measures HOW MUCH HAPPENED, not how fast the app is
-// — a still map legitimately reports single digits. So only report while frames are
-// actually being produced, and measure the busiest recent second rather than the last one.
-let fpsIdleSince = 0;
-function updateFps(now) {
-  if (now - lastFpsUpdate < 1000) return;
+// Counting how MANY frames went out measures how much happened, not how fast we are. This
+// renderer is event-driven — it draws when something moves and stays idle otherwise — so a
+// perfectly smooth map with one peer cursor easing across it honestly produced eight frames
+// that second, and "8 fps" is a true number answering a question nobody asked.
+// What is worth showing is the COST of a frame: how many we could sustain if we drew back to
+// back. That is the number that falls when the map gets heavy, which is the only moment this
+// counter earns its place in the header. Smoothed, and capped at the 60 Hz the browser will
+// hand us anyway — beyond that the figure would just be measuring an empty draw.
+const FPS_CEIL = 60;
+let frameCost = 1000 / FPS_CEIL, shownFps = 0;
+function updateFps(ms) {
+  frameCost += (ms - frameCost) * 0.15;              // EMA: one expensive frame is not the headline
   const el = $("#fpsCounter");
-  const span = (now - lastFpsUpdate) / 1000;
-  const rate = Math.round(frameCount / span);
-  frameCount = 0;
-  lastFpsUpdate = now;
   if (!el) return;
-  if (rate <= 2) {                                   // nothing is moving: not a frame rate
-    if (!fpsIdleSince) fpsIdleSince = now;
-    if (now - fpsIdleSince > 900) { el.style.color = "var(--muted)"; el.textContent = "idle"; }
-    return;
-  }
-  fpsIdleSince = 0;
-  currentFps = rate;
+  const rate = clampN(Math.round(1000 / Math.max(frameCost, 1000 / FPS_CEIL)), 1, FPS_CEIL);
+  if (rate === shownFps) return;                     // the header is rewritten only when it changes
+  shownFps = rate;
   el.style.color = rate >= 50 ? "var(--accent)" : rate >= 30 ? "#e0b155" : "#f0616d";
   el.textContent = rate + " fps";
+  el.title = "how many redraws a second the map could sustain (a redraw currently costs "
+           + frameCost.toFixed(1) + " ms). It does not count idle time: the map only draws when something moves.";
 }
-function render() { if (pending) return; pending = true; requestAnimationFrame((now) => {
-  frameCount++;
-  updateFps(now);
+function render() { if (pending) return; pending = true; requestAnimationFrame(() => {
   pending = false;
+  const t0 = performance.now();
   draw();
+  updateFps(performance.now() - t0);
 }); }
 
 function draw() {
@@ -1402,10 +1400,13 @@ function syncPenPow() {
   const q = $("#penQuest");
   if (q) {
     const left = DIGS_PER_UNLOCK - penDigs;
-    q.innerHTML = penFree
+    const html = penFree
       ? "every brush unlocked · slider free"
       : "dig <b>" + left + "</b> more with pen <b>" + Math.pow(2, penExp) + "</b> → "
         + (penExp < PEN_TOP_EXP ? "pen " + Math.pow(2, penExp + 1) : "the slider");
+    // Dragging the slider fires setPen() on every pixel, and innerHTML is a parse each time
+    // even when the sentence is identical — which is exactly when the brush feels sticky.
+    if (html !== q._html) { q._html = html; q.innerHTML = html; }
   }
 }
 // called once per FRESH patch — re-digging old ground is not progress
@@ -1641,6 +1642,16 @@ function applyURLGoto() {
   const p = new URLSearchParams(location.search);
   if (p.has("x") && p.has("y")) { try { goTo(BigInt(p.get("x")), BigInt(p.get("y"))); } catch (e) {} }
 }
+// ?dev=1 — every brush preset and the free slider straight away, for testing something that
+// needs a big pen without digging thirty patches to earn one. It flips the same flags the
+// progression would have flipped, so like any other unlock it stays in the save afterwards.
+function applyDevMode() {
+  if (new URLSearchParams(location.search).get("dev") !== "1") return;
+  penExp = PEN_TOP_EXP; penDigs = 0; penFree = true;
+  setPen(Math.pow(2, PEN_TOP_EXP));
+  showResetToast("dev mode — every brush unlocked");
+  scheduleSave();
+}
 // cryptographically-random BigInt in [0, maxExclusive)
 function randBig(maxExclusive) {
   const bits = maxExclusive.toString(2).length;
@@ -1859,6 +1870,7 @@ resize();
 if (isWholeSpaceMode) zoomFit();
 updateZoomDisplay();
 applyURLGoto();
+applyDevMode();
 initCandidateDB().then(() => updateCandidateShelf());   // populate the shelf from prior sessions
 
 // ---------- multiplayer (cursors and dug blocks of whoever is on your tile) ----------

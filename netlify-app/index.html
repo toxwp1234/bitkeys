@@ -69,14 +69,24 @@
       background:transparent;color:var(--text);font-size:12px;text-align:left}
     #peerMenu .pm-row:hover:not(:disabled){background:var(--panel2);border-color:var(--border)}
     .pm-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)}
-    .pm-where{font-size:10px;color:var(--muted);white-space:nowrap}
     .pm-empty{color:var(--muted);font-size:11px;padding:6px 4px}
-    /* how loudly other players' squares are painted — their colour either way */
-    .pm-opt{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;color:var(--muted);
-      padding:8px 4px 0;border-top:1px solid var(--border);margin-top:6px}
-    /* .on lives on header buttons only, and this one is in the popover — give it its own lit state */
-    #pmBlockAlpha{font-size:10px;padding:4px 9px}
-    #pmBlockAlpha.on{background:rgba(247,147,26,.14);border-color:var(--accent);color:var(--accent)}
+    /* The popover is three separate jobs — who you are, who else is here, how they are drawn —
+       and without labels people could not tell that a row is clickable or what the switch did. */
+    .pm-sec{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+      padding:9px 4px 4px;border-top:1px solid var(--border);margin-top:7px}
+    #pmStatus + .pm-sec{border-top:0;margin-top:0;padding-top:0}
+    .pm-hint{font-size:9.5px;color:var(--muted);padding:3px 4px 0;line-height:1.45}
+    /* two states side by side, the live one lit: a lone button cannot say whether its word is
+       the current setting or the thing it would switch to */
+    .pm-seg{display:flex;gap:4px;padding:1px 4px 0}
+    .pm-seg button{flex:1;font-size:10.5px;padding:5px 4px;background:var(--panel2);border:1px solid var(--border);
+      color:var(--muted);border-radius:7px}
+    .pm-seg button:hover{color:var(--text);border-color:#3a4454}
+    .pm-seg button.on{background:rgba(247,147,26,.14);border-color:var(--accent);color:var(--accent)}
+    .pm-go{font-size:10px;color:var(--muted);white-space:nowrap;border:1px solid var(--border);border-radius:6px;
+      padding:2px 6px;background:var(--panel2)}
+    #peerMenu .pm-row:hover:not(:disabled) .pm-go{color:var(--accent);border-color:var(--accent)}
+    .pm-here{font-size:10px;color:var(--accent);white-space:nowrap}
     .pm-foot{font-size:9.5px;color:var(--muted);padding:8px 4px 2px;border-top:1px solid var(--border);margin-top:6px;line-height:1.45}
     .separator{width:1px;height:26px;background:var(--border);flex:0 0 auto}
     .bar{flex:0 0 auto;display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
@@ -502,9 +512,21 @@
   <div id="resetToast"></div>
   <div id="peerMenu" hidden>
     <div id="pmStatus">…</div>
+
+    <div class="pm-sec">you</div>
     <div class="pm-me"><span class="pm-dot" id="pmMeDot"></span><input id="pmName" maxlength="20" placeholder="your name" spellcheck="false" /></div>
+    <div class="pm-hint">the dot is your colour on everyone else's map — click it to change</div>
+
+    <div class="pm-sec" id="pmListLabel">players</div>
     <div id="pmList"></div>
-    <div class="pm-opt"><span>others' squares</span><button type="button" class="ghost" id="pmBlockAlpha">faded</button></div>
+    <div class="pm-hint" id="pmListHint" hidden>click a player to fly to them</div>
+
+    <div class="pm-sec">how their dug squares look on your map</div>
+    <div class="pm-seg" id="pmAlpha">
+      <button type="button" data-alpha="faded">faded</button>
+      <button type="button" data-alpha="solid">same as mine</button>
+    </div>
+
     <div class="pm-foot">Shared with the players on your patch of the map: your cursor, name, brush size, and where you have dug. What a square turned up — keys, candidates, balances — never leaves this device.</div>
   </div>
   <div id="candidateShelf">

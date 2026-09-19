@@ -152,7 +152,8 @@ python scripts/serve_local.py      # http://127.0.0.1:8001 — app + Bloom filte
   anyone* otherwise) and on the same tile. The reliable way is one player using `fly there →` in
   the players popover.
 - `?mpdebug=1` narrates the channel work in the console: which region channel you are on and
-  every block in and out.
+  every block in and out. `?dev=1` unlocks every brush preset and the free slider straight away,
+  for testing something that needs a big pen (it is a real unlock, so it stays in the save).
 - Supabase needs no tables. Public channels must be allowed (Realtime → Settings); there is no
   auth, so channels are public.
 

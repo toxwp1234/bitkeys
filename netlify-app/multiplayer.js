@@ -185,7 +185,9 @@ export async function initMultiplayer(game) {
   const nameIn = document.getElementById("pmName");
   const meDot = document.getElementById("pmMeDot");
   const statusEl = document.getElementById("pmStatus");
-  const alphaBtn = document.getElementById("pmBlockAlpha");
+  const alphaBtns = Array.from(document.querySelectorAll("#pmAlpha button"));
+  const listLabel = document.getElementById("pmListLabel");
+  const listHint = document.getElementById("pmListHint");
   const STATUS_TEXT = {
     connecting: ["…", "var(--muted)", "connecting to the lobby…"],
     online: [null, "#4fb98a", "connected"],
@@ -618,10 +620,14 @@ export async function initMultiplayer(game) {
   }
   function renderList() {
     list.textContent = "";
+    if (listLabel) listLabel.textContent = peers.size ? "players · " + peers.size + " besides you" : "players";
+    if (listHint) listHint.hidden = !peers.size;
     if (!peers.size) {
       const empty = document.createElement("div");
       empty.className = "pm-empty";
-      empty.textContent = status === "local" ? "open this page in another tab to see a second player" : "nobody else here yet";
+      empty.textContent = status === "local" ? "open this page in another tab to see a second player"
+        : tileX === null ? "zoom in first — at this distance nobody is anywhere in particular"
+        : "nobody else here yet";
       list.appendChild(empty);
       return;
     }
@@ -635,15 +641,17 @@ export async function initMultiplayer(game) {
       const nm = document.createElement("span");
       nm.className = "pm-name"; nm.textContent = peer.name;
       const where = document.createElement("span");
-      where.className = "pm-where";
       if (peer.pos) {
         const [px, py] = game.project(peer.pos.x, peer.pos.y, peer.pos.fx, peer.pos.fy);
         const onScreen = peer.near && px >= 0 && py >= 0 && px <= w && py <= h;
-        where.textContent = onScreen ? "on screen" : "fly there →";
-        row.title = peer.near ? "on your tile — you can see each other's cursors and blocks"
-                              : "elsewhere on the map — fly over to meet them";
+        // The right-hand chip is the whole affordance: a row that only said "on screen" gave
+        // no hint that clicking it flies you across 2^128 keys.
+        where.className = onScreen ? "pm-here" : "pm-go";
+        where.textContent = onScreen ? "● here" : "fly there →";
+        row.title = (peer.near ? "on your patch of the map — you can see each other's cursors and squares"
+                               : "elsewhere on the map") + " · click to fly to " + peer.name;
         row.addEventListener("click", () => { openMenu(false); game.travelTo(peer.pos.x, peer.pos.y); });
-      } else { where.textContent = "—"; row.disabled = true; }
+      } else { where.className = "pm-go"; where.textContent = "—"; row.disabled = true; }
       row.append(dot, nm, where);
       list.appendChild(row);
     }
@@ -663,16 +671,17 @@ export async function initMultiplayer(game) {
     meDot.title = "your colour — click to change";
   }
   function syncAlpha() {
-    if (!alphaBtn) return;
-    const solid = alphaMode === "solid";
-    alphaBtn.textContent = solid ? "solid" : "faded";
-    alphaBtn.classList.toggle("on", solid);
-    alphaBtn.title = solid
-      ? "other players' squares are painted as solidly as your own — click for faded"
-      : "other players' squares are painted faded, so your own territory reads first — click for solid";
+    for (const b of alphaBtns) {
+      const on = b.dataset.alpha === alphaMode;
+      b.classList.toggle("on", on);
+      b.title = b.dataset.alpha === "solid"
+        ? "paint their squares as solidly as your own, so a jointly dug area reads as one"
+        : "paint their squares faded, so your own territory reads first";
+    }
   }
-  if (alphaBtn) alphaBtn.addEventListener("click", () => {
-    alphaMode = alphaMode === "solid" ? "faded" : "solid";
+  for (const b of alphaBtns) b.addEventListener("click", () => {
+    if (b.dataset.alpha === alphaMode) return;
+    alphaMode = b.dataset.alpha === "solid" ? "solid" : "faded";
     try { localStorage.setItem(ALPHA_STORE, alphaMode); } catch (e) {}
     syncAlpha();
     repaintAll();
