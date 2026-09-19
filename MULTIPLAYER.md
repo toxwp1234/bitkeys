@@ -1,4 +1,4 @@
-# Multiplayer — goal, current state, next step
+﻿# Multiplayer — goal, current state, next step
 
 Handoff note for whoever (human or agent) picks this branch up on another machine.
 Everything below is about `netlify-app/` — the static site that is the actual game.
@@ -199,3 +199,6 @@ does, and that is what keeps this whole feature free of a database.
 - Commit subject line, then a body of bullet points explaining *why*, and the subject ends
   with `[skip ci] [skip netlify]`.
 - Commits made by an agent end with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
+- Netlify scans the WHOLE commit message for the skip token, not just the subject. Never write
+  it in prose — a merge that explained it carried no skip marker was skipped for saying the words.
+  The merge meant to ship is the one commit that must not contain them anywhere.
