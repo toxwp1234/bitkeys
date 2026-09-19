@@ -358,6 +358,7 @@ export async function initMultiplayer(game) {
       if (now - b.at > BUSY_TTL) { peerBusy.delete(id); continue; }   // a scan that never reported back
       out.push({ x: b.x, y: b.y, c: b.c, color: colorOf(id) });
     }
+    dbg("drills on map:", out.length);
     game.showPeerBusy(out);
   }
   function clearPeerPatches() {
@@ -384,7 +385,10 @@ export async function initMultiplayer(game) {
       const ps = all.slice(i, i + BULK_CHUNK);
       if (!ps.length && i > 0) break;
       dbg("bulk ->", ps.length + " blocks", re ? "(reply to " + re + ")" : "(arrival)");
-      tileCh.send("bulk", { id: myId, re: re || "", ps });
+      // A drill already running when somebody arrives has no other way of reaching them: `busy`
+      // went out once, before they were on the channel. So the greeting carries it too.
+      const b = i === 0 && myBusy ? [myBusy.x.toString(16), myBusy.y.toString(16), myBusy.c] : null;
+      tileCh.send("bulk", { id: myId, re: re || "", ps, b });
     }
   }
   let replyTimer = 0, served = new Set();
@@ -400,7 +404,9 @@ export async function initMultiplayer(game) {
     dbg("bulk <-", p && p.id, (p && p.ps && p.ps.length) + " blocks", p && p.re ? "(reply)" : "(arrival)");
     if (!p || typeof p.id !== "string" || !ID_RE.test(p.id) || p.id === myId) return;
     if (takePatches(p.id, p.ps)) pushPatches();
-    if (p.re === myId) served.add(p.id);                         // this WAS the answer to our arrival
+    const b = Array.isArray(p.b) ? parseSquare(p.b[0], p.b[1], p.b[2]) : null;
+    if (b) { peerBusy.set(p.id, { x: b.x, y: b.y, c: b.c, at: Date.now() }); pushBusy(); }
+    if (p.re === myId) served.add(p.id);                       // this WAS the answer to our arrival
     else serveNewcomer(p.id);                                    // they just arrived — hand them ours
   }
   function onDig(p) {
