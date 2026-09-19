@@ -118,9 +118,11 @@ and an incoming message cannot have come from anywhere else.
   `multiplayer.js` hands over `{x,y,c,h,color}` plus the mode and lets `draw()` decide. The live
   `busy` markers stay in the digger's colour in every mode: that one is about *who*, not *what*.
 - Everything incoming is untrusted. Ids and 128-bit coordinates are regex- and range-checked, a
-  brush size must be a power of two, `h` is clamped to the square's own key count, names are
-  capped and written with `textContent`, colours are an index into a fixed palette, and a peer can
-  hold at most `PEER_PATCH_CAP` blocks. The worst a liar can do is paint squares on your screen
+  brush size must be a whole number within the app's own cap (**not** a power of two — the 1..8
+  presets are, but the slider that unlocks after them is not, and assuming otherwise silently
+  dropped every square from anyone digging at 586), `h` is clamped to the square's own key count,
+  names are capped and written with `textContent`, colours are an index into a fixed palette, and
+  a peer can hold at most `PEER_PATCH_CAP` blocks. The worst a liar can do is paint squares on your screen
   until you walk away. Keep it that way when adding fields.
 
 ### The rest of the machinery

@@ -39,6 +39,7 @@ const ALPHA_STORE = "cuvre-peer-alpha-v1";
 // reads as one picture instead of two. The app owns the ramp, so the choice is passed to it.
 const PEER_MODES = ["faded", "solid", "palette"];
 const BUSY_TTL = 60000;        // forget a peer's "digging here" marker if nothing ends it
+const MAX_BRUSH = 1000000;     // the app's own brush cap once the slider is unlocked (app.js penCap)
 // A tile is 2^64 keys a side — 1.8e19 of them across the map, so two players share one only
 // when they meant to, and once they do it takes a deliberate journey to leave it again.
 // It is deliberately huge: at any but the deepest zoom, one screen pixel is already millions of
@@ -208,7 +209,7 @@ export async function initMultiplayer(game) {
     const x = BigInt("0x" + p.x), y = BigInt("0x" + p.y);
     if (x >= game.W || y >= game.H) return null;
     const f = (v) => (Number.isFinite(v) ? clamp(v, 0, 0.999) : 0);
-    return { x, y, fx: f(p.fx), fy: f(p.fy), c: clamp(Math.floor(Number(p.c)) || 1, 1, 1000000),
+    return { x, y, fx: f(p.fx), fy: f(p.fy), c: clamp(Math.floor(Number(p.c)) || 1, 1, MAX_BRUSH),
              parked: !!p.parked, s: Number.isFinite(p.s) ? p.s : 0 };
   }
   function makePeer(id) {
@@ -296,7 +297,12 @@ export async function initMultiplayer(game) {
   function parseSquare(xs, ys, c) {
     if (typeof xs !== "string" || typeof ys !== "string" || !HEX_RE.test(xs) || !HEX_RE.test(ys)) return null;
     const n = Math.floor(Number(c));
-    if (!Number.isFinite(n) || n < 1 || n > 2 ** 40 || (n & (n - 1)) !== 0) return null;   // a brush is a power of two
+    // A brush is NOT a power of two. The 1..8 presets are, but the slider that unlocks after them
+    // hands out any whole number up to the app's own cap — so this used to silently drop every
+    // square and every drill marker from anyone digging at, say, 586, and the sender had no way
+    // to tell. Range is the only shape rule there is; the coordinate checks and PEER_PATCH_CAP
+    // do the rest.
+    if (!Number.isFinite(n) || n < 1 || n > MAX_BRUSH) return null;
     const x = BigInt("0x" + xs), y = BigInt("0x" + ys);
     if (x >= game.W || y >= game.H) return null;
     return { key: xs + "," + ys + "," + n, x, y, c: n };
@@ -341,6 +347,7 @@ export async function initMultiplayer(game) {
       const color = colorOf(id);
       for (const p of mine.values()) out.push({ x: p.x, y: p.y, c: p.c, h: p.h, color });
     }
+    dbg("squares on map:", out.length);
     game.showPeerPatches(out, alphaMode);
   }
   function pushBusy() {
