@@ -8,14 +8,18 @@ Everything below is about `netlify-app/` — the static site that is the actual 
 Turn the keyspace map into a place where you can tell other people are there, without
 giving up free static hosting.
 
-1. **Phase 1 — cursors (DONE, this branch).** Everyone sees everyone else's cursor,
-   brush square and name, live.
-2. **Phase 2 — a shared map (NEXT, not started).** Revealed blocks (scanned patches) are
-   shared: you see where other players have already dug, and they see where you have.
-3. **Phase 3 — meeting another player (LATER, ideas only).** When two players end up in
-   the same spot on the map, they open a direct WebRTC peer-to-peer link (Supabase used
-   only for signalling) and trade things we do NOT want broadcast to everybody — e.g.
-   locally explored fragments, or whatever the meeting mechanic turns out to be.
+1. **Phase 1 — cursors (DONE).** Everyone sees everyone else's cursor, brush square and name.
+2. **Phase 2 — meeting, and sharing what you dug (DONE, this branch).** When two players are in
+   the same place they see each other's cursors *and* each other's dug blocks. Nothing is stored
+   anywhere: what you see is what the people currently standing next to you are sending you.
+3. **Phase 3 — trading (LATER, ideas only).** Two players in the same spot open a direct WebRTC
+   peer-to-peer link (Supabase only for signalling) and trade things we do NOT want broadcast to
+   everybody — e.g. locally explored fragments, or whatever the meeting mechanic turns out to be.
+
+An earlier draft of phase 2 had the dug blocks stored in Supabase Postgres, so a block stayed on
+the map after the player who dug it left. That was dropped deliberately: blocks now live for the
+session, between players who are actually present. **There is no database and no SQL** — no
+tables, no RLS, no migration, nothing to wipe.
 
 ## Hard constraints — do not break these
 
@@ -26,9 +30,11 @@ giving up free static hosting.
 - **Netlify must not build.** The owner is low on Netlify credits. Every commit message
   (merge commits included) ends with `[skip ci] [skip netlify]`. Test locally instead.
 - **Supabase free tier is the budget.** See the numbers below and design for them.
-- **Never commit a Supabase secret / service_role key.** Only the publishable (anon) key
-  belongs in the client, and even that lives in `multiplayer-config.js`, which ships empty
-  in git until someone fills it in.
+- **Never commit a Supabase secret / service_role key.** It belongs to a backend and this site
+  has none, so it has no business existing in the client at all. The publishable (anon) key is
+  public by design — it ships to every browser that opens the page, which is why it lives in
+  `multiplayer-config.js` in the repo. Protection comes from the project's own Realtime settings,
+  never from hiding that string.
 
 ## Supabase free tier — the numbers that shape the design
 
@@ -40,54 +46,94 @@ giving up free static hosting.
 | Messages per second | 100 |
 | Presence messages per second | 20 (whole project) |
 | Broadcast payload | 256 KB |
-| Postgres database | 500 MB |
 
-Practical consequence: never send on a timer. Send on change, throttled, and stop entirely
-when nothing is happening. Two players moving their mice non-stop cost roughly 50k
-messages an hour.
+Practical consequence: never send on a timer. Send on change, throttled, stop entirely when
+nothing is happening — and send nothing at all when nobody is near enough to receive it.
 
-## Phase 1 — what is already built
+## How it works
 
 Files (all under `netlify-app/`):
 
 | File | Role |
 | --- | --- |
-| `multiplayer.js` | the whole feature: transports, peer state, rendering, header UI |
+| `multiplayer.js` | the whole feature: transports, channels, peer state, rendering, header UI |
 | `multiplayer-config.js` | Supabase Project URL + publishable key; **empty = multiplayer off** |
-| `app.js` | ~25 added lines at the end: dynamic `import()` + the `game` bridge object |
+| `app.js` | ~35 added lines: the `game` bridge object, the peer-block draw pass, `mp.dug()` |
 | `index.html` | `#peers` layer styles, the `online N` header stat, the `#peerMenu` popover |
 
-How it hangs together:
+### Two levels of channel
+
+- **Lobby** — one channel for the whole game (`keyspace`, or `keyspace-dev` on localhost),
+  **Presence only**. Who is online, their name, colour and a settled position. In a 2^128-wide
+  map nobody is ever accidentally near anybody, so this list — and the `fly there →` button in
+  the popover — is the only way to find another player at all.
+- **Region** — one channel per TILE of the map, `keyspace-t<x>_<y>`. You are on exactly one at a
+  time, the one you are looking at, and it carries the live cursors and the dug blocks. Four
+  players in the same place share **one** channel; there is no pair-wise mesh to book-keep.
+
+"Near each other" therefore means "on the same tile", which is also literally "on the same
+channel". There is no separate proximity check that could drift out of sync with the traffic,
+and an incoming message cannot have come from anywhere else.
+
+### Which tile you are on
+
+- A tile is **2^64 keys a side** (`TILE_BITS`), so there are 1.8e19 of them. Two players share one
+  only because they travelled to each other, and once they have, it takes a deliberate journey to
+  leave it again.
+- The tile is taken from the **camera**, never from the cursor. Zoomed out, one screen pixel is
+  already 10^36 keys, so a cursor-derived tile would change faster than a channel can subscribe.
+  (This was the first version and it was unusable — see `game.view()` in `app.js`.)
+- Zoomed out far enough that the **screen is wider than a whole tile**, you are nowhere in
+  particular: we hold no region channel, draw no cursors, and cost nothing. The header says
+  *zoom in to meet anyone*. You have to actually be somewhere to be somewhere with someone.
+- A tile change only takes effect after `TILE_SETTLE` (1.2 s) on the new tile, so skimming a
+  border does not resubscribe.
+
+### Sharing the dug blocks
+
+- A shared block is three numbers: `x`, `y` and the brush size `c`. Nothing else — no key, no
+  balance, no candidate, no count of what you flagged.
+- **On arriving** on a tile you broadcast a `bulk` of your own blocks in it (an empty one still
+  goes out: it is also "hello"). Anyone already there answers with one `bulk` of their own,
+  addressed with `re: <your id>`. That `re` is what stops the two sides bouncing bulks off each
+  other forever — the whole exchange is two messages.
+- **After that**, each block you dig goes out as a single `dig` — and only if somebody is
+  actually on your tile. Alone, the feature is completely silent.
+- Blocks you receive are **display only**: drawn under your own territory, tinted with the
+  owner's colour, and left out of `Save as PNG`. They never touch `keysScanned`, the found
+  counter or pen progression (`creditDig`), they are never saved, and they are dropped the moment
+  that player leaves your tile or you leave it yourself.
+- Everything incoming is untrusted. Ids and 128-bit coordinates are regex- and range-checked, a
+  brush size must be a power of two, names are capped and written with `textContent`, colours are
+  an index into a fixed palette, and a peer can hold at most `PEER_PATCH_CAP` blocks. The worst a
+  liar can do is paint squares on your screen until you walk away. Keep it that way when adding
+  fields.
+
+### The rest of the machinery
 
 - `app.js` loads `multiplayer.js` with a **dynamic import, last, wrapped in `.catch()`**.
-  A missing config, a blocked CDN or a bug in multiplayer can never take the map down.
-  Keep it that way.
+  A missing config, a blocked CDN or a bug in multiplayer can never take the map down. Keep it
+  that way.
 - The map exposes exactly one object and nothing else:
-  `{ stage, W, H, isLocal, cellPx(), pointer(), project(x, y, fx, fy), travelTo(x, y) }`.
-  `pointer()` returns the key under the cursor (`BigInt x, y` + sub-cell fraction + brush
-  size + `parked`); `project()` turns a key back into stage pixels. All map internals
-  (`viewX`, `subX`, zoom, BigInt maths) stay inside `app.js`.
-- `multiplayer.js` returns `{ layout, pointerMoved }`. `draw()` calls `layout()` so peers
-  follow the camera; `positionCursor()` calls `pointerMoved()`, which is throttled inside.
-- **Two transports behind one four-call interface** (`join / update / move / leave`):
-  - **Supabase** — Broadcast (event `pos`) for movement, Presence for who is online plus a
-    settled position so a fresh joiner sees players who are standing still.
-  - **BroadcastChannel** — localhost only, when no keys are configured (or `?mp=local`).
-    Tabs of one browser see each other, zero Supabase messages. This is the free test rig.
-  Adding a new feature means adding a call to **both** transports, or the local test rig
-  stops representing production.
-- Traffic discipline already in place: movement at most every 300 ms and only when the
-  pointer actually moved; presence re-tracked only after 1.5 s of stillness and at most
-  every 5 s; a background tab drops its connection after 30 s and rejoins when visible.
-- Receivers interpolate between updates in **key space** (not pixels), so a zoom mid-glide
-  stays correct; a jump larger than a couple of screens snaps instead of sliding.
-- Channel name is `keyspace` in production and `keyspace-dev` on localhost, so testing
-  never shows up for real players.
-- Everything incoming is treated as untrusted: ids and 128-bit coordinates are regex- and
-  range-checked, names are capped and written with `textContent`, colours are an index into
-  a fixed palette. Keep this when adding fields.
-- Shared today: cursor position, brush size, name, colour. **Nothing that is scanned,
-  flagged or found is shared**, and the popover promises the player exactly that.
+  `{ stage, W, H, isLocal, cellPx(), pointer(), view(), project(), travelTo(), myPatches(),
+  showPeerPatches() }`. All map internals (`viewX`, `subX`, zoom, BigInt maths) stay in `app.js`.
+- `multiplayer.js` returns `{ layout, pointerMoved, dug }`. `draw()` calls `layout()` so peers
+  follow the camera *and* so a zoom with the mouse held still still changes your tile;
+  `positionCursor()` calls `pointerMoved()`; `commitPatch()` calls `dug()`.
+- **Two transports behind one interface.** A transport hands out channels, each
+  `{ track(meta), send(event, payload), close() }`, reporting through
+  `{ presence, message, status }`:
+  - **Supabase** — Presence for who is there, Broadcast for `pos`, `dig` and `bulk`. supabase-js
+    multiplexes every channel over one websocket, so lobby + region is still one connection.
+  - **BroadcastChannel** — localhost only, when no keys are configured (or `?mp=local`). Tabs of
+    one browser see each other, zero Supabase messages.
+  Adding a feature means adding an **event**, never a third transport — otherwise the local test
+  rig stops representing production.
+- Traffic discipline: movement at most every 300 ms and only when the pointer really moved and
+  only when somebody is on your tile; presence re-tracked only after 1.5 s of stillness and at
+  most every 5 s; a background tab drops its connection after 30 s and rejoins when visible.
+- Receivers interpolate between updates in **key space** (not pixels), so a zoom mid-glide stays
+  correct; a jump larger than a couple of screens snaps instead of sliding.
 
 ### Running it
 
@@ -95,55 +141,38 @@ How it hangs together:
 python scripts/serve_local.py      # http://127.0.0.1:8001 — app + Bloom filter parts
 ```
 
-- **Free mode (no Supabase):** leave `multiplayer-config.js` empty and open the page in two
-  windows of the *same* browser. Header shows `ONLINE 2` in amber ("local test mode").
-  Two windows, not two tabs — a background tab disconnects after 30 s on purpose.
-- **Real mode:** paste the Project URL and publishable key into `multiplayer-config.js`
-  (Supabase dashboard → Project Settings → API), then open the page in **two different
-  browsers** (Chrome + Firefox). Local mode cannot cross browsers, so if they see each
-  other it is genuinely going through Supabase. Header shows `ONLINE 2` in green.
-  Supabase dashboard → Realtime → Inspector, channel `keyspace-dev`, shows the raw traffic.
-- Supabase needs no tables for phase 1. Public channels must be allowed
-  (Realtime → Settings); there is no auth, so channels are public.
+- **Real mode:** the keys are in `multiplayer-config.js`, so the page uses Supabase even on
+  localhost (channel `keyspace-dev`). Open it in **two different browsers** (Chrome + Firefox);
+  if they see each other it is genuinely going through Supabase. Supabase dashboard → Realtime →
+  Inspector shows the raw traffic.
+- **Free mode:** add `?mp=local` on localhost and two tabs of the *same* browser see each other
+  over BroadcastChannel, without spending a single Supabase message. Cross-browser cannot work in
+  this mode — that is the point of it.
+- **To actually meet:** both players must be zoomed in (the header will say *zoom in to meet
+  anyone* otherwise) and on the same tile. The reliable way is one player using `fly there →` in
+  the players popover.
+- `?mpdebug=1` narrates the channel work in the console: which region channel you are on and
+  every block in and out.
+- Supabase needs no tables. Public channels must be allowed (Realtime → Settings); there is no
+  auth, so channels are public.
 
-## Phase 2 — shared revealed blocks (the next job)
+#### A bug that is not a bug
 
-**Decided:**
+"Firefox could not see Chrome, but Chrome saw itself" was simply `multiplayer-config.js` being
+empty: with no keys, localhost falls back to BroadcastChannel, which is same-browser only. Two
+Chrome windows found each other, Firefox was alone. With the keys filled in it goes through
+Supabase and crosses browsers.
 
-- The map is a **shared world stored in Supabase Postgres**, not only a peer-to-peer
-  exchange: a block stays visible after the player who dug it goes offline.
-- A stored block is: **brush size, x, y, number of flagged keys** (in `app.js` terms a
-  patch `{c, x, y, h}` — `h` is what tints the square).
-- Other players' blocks are **display only**. They must NOT count toward your
-  `keysScanned`, your `found` counter or your pen progression (`creditDig`). Your own
-  progress stays yours.
+## Phase 3 — trading (ideas, nothing decided)
 
-**Open questions — decide with the owner before writing SQL:**
+WebRTC full mesh is fine for 2–6 players in one spot; Supabase only carries the offer / answer /
+ICE candidates, and the region channel is already the obvious place to do that signalling.
+Mechanic ideas floated so far: trade explored fragments, a bonus for digging the same spot
+together, mutual verification of a find, beacons left behind for offline players, a "who you have
+met" graph.
 
-1. **Loading.** The map is 2^128 × 2^128, so "fetch all blocks" only works while the
-   table is small. Region queries need a sane key: store x/y as fixed-width hex text
-   (32 chars, so lexicographic order = numeric order) or as `bytea`, and query the visible
-   rectangle; or bucket blocks into coarse tiles and fetch tile by tile. Postgres has no
-   128-bit integer type — `numeric` works but indexes poorly compared to fixed-width text.
-2. **Live updates.** Postgres Changes (every insert costs one message per subscriber) vs
-   Broadcast on the existing channel plus a REST read on load. Broadcast is cheaper and we
-   already have the channel.
-3. **Write abuse.** With the anon key, anybody can insert. Options: rate limit in a
-   Postgres trigger, constrain the shape (brush size must be a power of two, `h` must be
-   plausible for the area), or accept it while the game is small and keep a wipe script.
-4. **Storage.** A row is ~100–150 bytes with index overhead, so 500 MB is roughly 3 million
-   blocks. Worth a cap or a dedupe on (x, y, c).
-5. **Rendering.** `app.js` draws `patches` (yours, heat-tinted) and `grayPatches` (your old
-   territory, gray). Other players' blocks want a third list with its own look — tinted by
-   the owner's colour is the obvious choice, and it must not be included in `Save as PNG`
-   unless we decide it should be.
-
-## Phase 3 — meeting a player (ideas, nothing decided)
-
-WebRTC full mesh is fine for 2–6 players in one spot; Supabase only carries the offer /
-answer / ICE candidates. Mechanic ideas floated so far: trade explored fragments, a bonus
-for digging the same spot together, mutual verification of a find, beacons left behind for
-offline players, a "who you have met" graph.
+Worth deciding at the same time: whether anything should ever outlive the session. Today nothing
+does, and that is what keeps this whole feature free of a database.
 
 ## Git conventions in this repo
 

@@ -1,16 +1,27 @@
 "use strict";
-// ---------- multiplayer, phase 1: see where the other players are ----------
-// Only a cursor goes over the wire: which key it is on, the brush size, a name and a colour.
-// Nothing you scan, flag or find is shared.
+// ---------- multiplayer: see the other players, and what they have dug ----------
+// Two levels, because the keyspace is 2^128 wide and a global channel for everything would be
+// both useless and unaffordable:
 //
-// Two channels, because the free Supabase plan prices them very differently:
-//   Broadcast  live movement. Counted per RECIPIENT (one send to 5 players = 6 messages) against
-//              a 2M/month quota, so it is sent only while the pointer actually moves, at most
-//              every SEND_EVERY ms, and never while you sit still.
-//   Presence   who is online, plus a SETTLED position so someone who just joined can see a
-//              player who is not moving. Capped at 20 presence messages per second for the
-//              whole project, so it is re-tracked only once movement stops, and rarely.
-// The receiving side interpolates between updates, so ~3 updates a second still reads as smooth.
+//   LOBBY   one channel for the whole game, Presence only. Who is online, their name, colour and
+//           a settled position, so the players popover can say "fly there →". This is how you
+//           find anybody at all in a space where nobody is ever accidentally nearby.
+//   TILE    one channel per TILE of the map (2^TILE_BITS keys a side). You are on exactly one at
+//           a time, the one you are looking at. It carries the live cursors and the dug blocks.
+//           Four players standing in the same place share ONE channel — no pair-wise mesh.
+//
+// "Near each other" therefore means "on the same tile", which is also literally "on the same
+// channel": there is no separate proximity check to keep in sync with the traffic.
+//
+// Free-plan pricing shapes all of it. Broadcast is counted per RECIPIENT against 2M/month, so:
+// nothing is ever sent on a timer, movement goes out at most every SEND_EVERY ms and only while
+// the pointer really moves, and NOTHING at all is sent while you are alone on your tile.
+// Presence is capped at 20 messages/second project-wide, so it is re-tracked only once movement
+// has stopped, and rarely.
+//
+// Blocks other players dug are display only: they are drawn, they are not yours. They never
+// touch keysScanned, the found counter or pen progression, they are not saved, and they live
+// only as long as you stay on that tile.
 import { SUPABASE_URL, SUPABASE_KEY } from "./multiplayer-config.js";
 
 const SUPABASE_JS = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.116.0/+esm";
@@ -21,8 +32,24 @@ const HIDDEN_GRACE = 30000;    // a background tab lets go of its connection aft
 const EASE_MS = 90;            // interpolation time constant on the receiving side
 const NAME_MAX = 20;
 const ME_STORE = "cuvre-player-v1";
+// A tile is 2^64 keys a side — 1.8e19 of them across the map, so two players share one only
+// when they meant to, and once they do it takes a deliberate journey to leave it again.
+// It is deliberately huge: at any but the deepest zoom, one screen pixel is already millions of
+// keys, so a small tile would change under the cursor faster than a channel can be subscribed.
+const TILE_BITS = 64n;
+const TILE_SPAN = Math.pow(2, 64);   // the same size as a float, to compare against the viewport
+const TILE_SETTLE = 1200;      // ms on a new tile before we actually switch channel (no flapping)
+const BULK_CHUNK = 600;        // blocks per bulk message — the payload cap is 256 KB
+const PEER_PATCH_CAP = 4000;   // per peer, per tile; a flood cannot grow our memory without bound
+const REPLY_DELAY = 400;       // ms to coalesce "someone new arrived, send them my blocks"
+const EVENTS = ["pos", "dig", "bulk"];
 // Never the app's own orange: that is YOUR cursor.
 const COLORS = ["#4fb3ff", "#3fd68a", "#ff6b9a", "#b58cff", "#ffd84f", "#4fe0d2", "#ff8a5c", "#c7e05a"];
+
+// ?mpdebug=1 narrates the channel work in the console: which region channel you are on and every
+// block that goes out or comes in. Silent otherwise, so it costs production nothing.
+const DBG = new URLSearchParams(location.search).has("mpdebug");
+const dbg = (...a) => { if (DBG) console.log("[mp]", ...a); };
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const ID_RE = /^[a-z0-9]{6,24}$/;
@@ -46,77 +73,88 @@ function loadMe() {
 }
 function saveMe(me) { try { localStorage.setItem(ME_STORE, JSON.stringify(me)); } catch (e) {} }
 
-// ---------- transports: the same four calls over Supabase, or over a same-browser channel ----------
-async function supabaseTransport(room, cb) {
+// ---------- transports ----------
+// One interface, two implementations. A transport hands out CHANNELS; each channel is
+// { track(meta), send(event, payload), close() } and reports back through
+// { presence(state), message(event, payload), status(s) }. Everything above this line is
+// written once and runs over either. Adding a feature means adding an event, not a transport.
+async function supabaseTransport() {
   const { createClient } = await import(SUPABASE_JS);
   const client = createClient(SUPABASE_URL, SUPABASE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
   });
-  let ch = null, live = false, meta = null;
-  function open() {
-    ch = client.channel(room, { config: { presence: { key: myId }, broadcast: { self: false } } });
-    ch.on("presence", { event: "sync" }, () => {
-      const out = {};
-      const state = ch.presenceState();
-      for (const k in state) { const list = state[k]; if (list && list.length) out[k] = list[list.length - 1]; }
-      cb.peers(out);
-    });
-    ch.on("broadcast", { event: "pos" }, (m) => cb.move(m && m.payload));
-    ch.subscribe((status) => {
-      live = status === "SUBSCRIBED";
-      if (live && meta) ch.track(meta);             // (re)joined: say who we are and where
-      cb.status(live ? "online" : status === "CLOSED" ? "offline" : "retrying");
-    });
-  }
   return {
-    // Never send before the join has landed: supabase-js would quietly fall back to a REST call,
-    // which costs the same message and arrives out of order.
-    join(m) { meta = m; if (!ch) { cb.status("connecting"); open(); } else if (live) ch.track(m); },
-    update(m) { meta = m; if (live) ch.track(m); },
-    move(p) { if (live) ch.send({ type: "broadcast", event: "pos", payload: p }); },
-    leave() { if (ch) { const c = ch; ch = null; live = false; client.removeChannel(c); } cb.peers({}); },
+    // supabase-js multiplexes every channel over ONE websocket, so the lobby and the tile
+    // together still cost a single one of the free plan's 200 connections.
+    channel(room, h) {
+      let live = false, meta = null;
+      const ch = client.channel(room, { config: { presence: { key: myId }, broadcast: { self: false } } });
+      ch.on("presence", { event: "sync" }, () => {
+        const out = {};
+        const state = ch.presenceState();
+        for (const k in state) { const list = state[k]; if (list && list.length) out[k] = list[list.length - 1]; }
+        h.presence(out);
+      });
+      for (const ev of EVENTS) ch.on("broadcast", { event: ev }, (m) => h.message(ev, m && m.payload));
+      ch.subscribe((status) => {
+        live = status === "SUBSCRIBED";
+        if (live && meta) ch.track(meta);            // (re)joined: say who we are and where
+        h.status(live ? "online" : status === "CLOSED" ? "offline" : "retrying");
+      });
+      return {
+        track(m) { meta = m; if (live) ch.track(m); },
+        // Never send before the join has landed: supabase-js would quietly fall back to a REST
+        // call, which costs the same message and arrives out of order.
+        send(ev, p) { if (live) ch.send({ type: "broadcast", event: ev, payload: p }); },
+        close() { live = false; client.removeChannel(ch); },
+      };
+    },
+    close() { client.removeAllChannels(); },
   };
 }
 
 // Localhost without a Supabase project: tabs of this browser find each other. Presence is
 // rebuilt by hand — hello on join, a heartbeat, bye on leave, and a timeout for tabs that die.
-function localTransport(room, cb) {
-  const bc = new BroadcastChannel("cuvre-mp:" + room);
-  const peers = new Map();                          // id -> { meta, seen }
-  let meta = null, beat = 0;
-  const emit = () => { const out = {}; for (const [id, p] of peers) out[id] = p.meta; cb.peers(out); };
-  bc.onmessage = (e) => {
-    const m = e.data;
-    if (!m || m.id === myId || !ID_RE.test(m.id || "")) return;
-    if (m.t === "meta" || m.t === "hello") {
-      peers.set(m.id, { meta: m.meta, seen: Date.now() }); emit();
-      if (m.t === "hello" && meta) bc.postMessage({ t: "meta", id: myId, meta });   // introduce ourselves back
-    } else if (m.t === "pos") {
-      const p = peers.get(m.id); if (p) p.seen = Date.now();
-      cb.move(m.pos);
-    } else if (m.t === "bye") { if (peers.delete(m.id)) emit(); }
-  };
+function localTransport() {
   return {
-    join(m) {
-      meta = m; bc.postMessage({ t: "hello", id: myId, meta: m });
-      clearInterval(beat);
+    channel(room, h) {
+      const bc = new BroadcastChannel("cuvre-mp:" + room);
+      const peers = new Map();                       // id -> { meta, seen }
+      let meta = null, beat = 0;
+      const emit = () => { const out = {}; for (const [id, p] of peers) out[id] = p.meta; h.presence(out); };
+      bc.onmessage = (e) => {
+        const m = e.data;
+        if (!m || m.id === myId || !ID_RE.test(m.id || "")) return;
+        if (m.t === "meta" || m.t === "hello") {
+          peers.set(m.id, { meta: m.meta, seen: Date.now() }); emit();
+          if (m.t === "hello" && meta) bc.postMessage({ t: "meta", id: myId, meta });   // introduce ourselves back
+        } else if (m.t === "ev") {
+          const p = peers.get(m.id); if (p) p.seen = Date.now();
+          h.message(m.ev, m.payload);
+        } else if (m.t === "bye") { if (peers.delete(m.id)) emit(); }
+      };
       beat = setInterval(() => {
         if (meta) bc.postMessage({ t: "meta", id: myId, meta });
         let gone = false;
         for (const [id, p] of peers) if (Date.now() - p.seen > 7000) { peers.delete(id); gone = true; }
         if (gone) emit();
       }, 2500);
-      cb.status("local");
+      // Asynchronously, so a caller can finish wiring the handle up before it is told it is live.
+      setTimeout(() => h.status("local"), 0);
+      return {
+        track(m) { const first = !meta; meta = m; bc.postMessage({ t: first ? "hello" : "meta", id: myId, meta: m }); },
+        send(ev, p) { bc.postMessage({ t: "ev", ev, id: myId, payload: p }); },
+        close() { clearInterval(beat); bc.postMessage({ t: "bye", id: myId }); bc.close(); peers.clear(); },
+      };
     },
-    update(m) { meta = m; bc.postMessage({ t: "meta", id: myId, meta: m }); },
-    move(p) { bc.postMessage({ t: "pos", id: myId, pos: p }); },
-    leave() { clearInterval(beat); beat = 0; bc.postMessage({ t: "bye", id: myId }); peers.clear(); cb.peers({}); },
+    close() {},
   };
 }
 
 // ---------- the game-facing side ----------
 // game: { stage, W, H, isLocal, pointer() -> {x,y,fx,fy,c,parked},
-//         project(x, y, fx, fy) -> [px, py], cellPx(), travelTo(x, y) }
+//         project(x, y, fx, fy) -> [px, py], cellPx(), travelTo(x, y),
+//         myPatches() -> [{x,y,c,h}], showPeerPatches(list) }
 export async function initMultiplayer(game) {
   const configured = !!(SUPABASE_URL && SUPABASE_KEY);
   const forceLocal = new URLSearchParams(location.search).get("mp") === "local";
@@ -124,7 +162,7 @@ export async function initMultiplayer(game) {
   if (!configured && !useLocal) return null;         // production without keys: no UI, no traffic
 
   const me = loadMe();
-  const peers = new Map();                           // id -> peer
+  const peers = new Map();                           // id -> peer (everyone online, lobby-wide)
   const layer = document.createElement("div");
   layer.id = "peers";
   game.stage.appendChild(layer);
@@ -147,7 +185,7 @@ export async function initMultiplayer(game) {
   let status = "connecting";
   let seq = 0;
 
-  // ---- incoming ----
+  // ---- incoming: cursors ----
   function parsePos(p) {
     if (!p || typeof p !== "object" || typeof p.x !== "string" || typeof p.y !== "string") return null;
     if (!HEX_RE.test(p.x) || !HEX_RE.test(p.y)) return null;
@@ -163,7 +201,18 @@ export async function initMultiplayer(game) {
     el.innerHTML = '<div class="peer-pen"></div><div class="peer-dot"></div><div class="peer-tag"><span class="peer-arrow">➤</span><span class="peer-name"></span></div>';
     layer.appendChild(el);
     return { id, el, pen: el.firstChild, tag: el.lastChild, arrow: el.querySelector(".peer-arrow"), nameEl: el.querySelector(".peer-name"),
-             name: "", color: -1, pos: null, ox: 0, oy: 0, s: -1, tw: 0, th: 0 };
+             name: "", color: -1, pos: null, ox: 0, oy: 0, s: -1, tw: 0, th: 0, near: false };
+  }
+  function peerFor(id) {
+    let peer = peers.get(id);
+    if (!peer) { peer = makePeer(id); peers.set(id, peer); }
+    return peer;
+  }
+  function applyMeta(peer, m) {
+    const name = typeof m.name === "string" && m.name.trim() ? m.name.trim().slice(0, NAME_MAX) : "anon";
+    if (name !== peer.name) { peer.name = name; peer.nameEl.textContent = name; peer.tw = 0; }   // textContent: names are untrusted
+    const color = Number.isInteger(m.color) && m.color >= 0 && m.color < COLORS.length ? m.color : 0;
+    if (color !== peer.color) { peer.color = color; peer.el.style.setProperty("--pc", COLORS[color]); repaintPeerPatches(peer.id); }
   }
   function setPos(peer, pos) {
     if (!pos || pos.s < peer.s) return;              // a settled presence position older than the live one
@@ -179,28 +228,150 @@ export async function initMultiplayer(game) {
     peer.pos = pos; peer.s = pos.s;
     animate();
   }
-  function onPeers(state) {
+  // The lobby owns the roster: it is the only thing that creates and removes players.
+  function onLobbyPeers(state) {
     const alive = new Set();
     for (const id in state) {
       const m = state[id];
       if (id === myId || !ID_RE.test(id) || !m || typeof m !== "object") continue;
       alive.add(id);
-      let peer = peers.get(id);
-      if (!peer) { peer = makePeer(id); peers.set(id, peer); }
-      const name = typeof m.name === "string" && m.name.trim() ? m.name.trim().slice(0, NAME_MAX) : "anon";
-      if (name !== peer.name) { peer.name = name; peer.nameEl.textContent = name; peer.tw = 0; }   // textContent: names are untrusted
-      const color = Number.isInteger(m.color) && m.color >= 0 && m.color < COLORS.length ? m.color : 0;
-      if (color !== peer.color) { peer.color = color; peer.el.style.setProperty("--pc", COLORS[color]); }
+      const peer = peerFor(id);
+      applyMeta(peer, m);
       setPos(peer, parsePos(m));
     }
-    for (const [id, peer] of peers) if (!alive.has(id)) { peer.el.remove(); peers.delete(id); }
+    for (const [id, peer] of peers) if (!alive.has(id)) { peer.el.remove(); peers.delete(id); forgetPeerPatches(id); }
+    layout();
+    renderStatus();
+  }
+  // The tile channel owns who is NEAR: only those get a cursor drawn and exchange blocks.
+  function onTilePeers(state) {
+    const near = new Set();
+    for (const id in state) {
+      const m = state[id];
+      if (id === myId || !ID_RE.test(id) || !m || typeof m !== "object") continue;
+      near.add(id);
+      const peer = peerFor(id);
+      applyMeta(peer, m);                            // usable even if the lobby sync is lagging
+      if (!peer.near) peer.near = true;
+      setPos(peer, parsePos(m));
+    }
+    for (const [id, peer] of peers) {
+      if (near.has(id) || !peer.near) continue;
+      peer.near = false;                             // walked off our tile: cursor and blocks go
+      forgetPeerPatches(id);
+    }
+    nearIds = near;
     layout();
     renderStatus();
   }
   function onMove(p) {
     if (!p || typeof p.id !== "string") return;
     const peer = peers.get(p.id);                    // unknown until presence has introduced it
-    if (peer) setPos(peer, parsePos(p));
+    if (peer && peer.near) setPos(peer, parsePos(p));
+  }
+
+  // ---- incoming: dug blocks ----
+  // Everything here is untrusted. A block is four numbers and nothing else; it is drawn and never
+  // counted, so the worst a liar can do is paint squares on your screen until you leave the tile.
+  const peerPatches = new Map();                     // id -> Map("xhex,yhex,c" -> {x,y,c,fill})
+  let nearIds = new Set();
+  function fillFor(id) {
+    const peer = peers.get(id);
+    const hex = COLORS[peer && peer.color >= 0 ? peer.color : 0];
+    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    return "rgba(" + r + "," + g + "," + b + ",0.28)";
+  }
+  function parsePatch(a) {
+    if (!Array.isArray(a) || a.length < 3) return null;
+    const [xs, ys, c] = a;
+    if (typeof xs !== "string" || typeof ys !== "string" || !HEX_RE.test(xs) || !HEX_RE.test(ys)) return null;
+    const n = Math.floor(Number(c));
+    if (!Number.isFinite(n) || n < 1 || n > 2 ** 40 || (n & (n - 1)) !== 0) return null;   // a brush is a power of two
+    const x = BigInt("0x" + xs), y = BigInt("0x" + ys);
+    if (x >= game.W || y >= game.H) return null;
+    return { key: xs + "," + ys + "," + n, x, y, c: n };
+  }
+  function takePatches(id, arr) {
+    if (!Array.isArray(arr) || !arr.length) return false;
+    let mine = peerPatches.get(id);
+    if (!mine) { mine = new Map(); peerPatches.set(id, mine); }
+    const fill = fillFor(id);
+    let added = false;
+    for (const a of arr) {
+      if (mine.size >= PEER_PATCH_CAP) break;
+      const p = parsePatch(a);
+      if (!p || mine.has(p.key)) continue;
+      p.fill = fill;
+      mine.set(p.key, p);
+      added = true;
+    }
+    return added;
+  }
+  function forgetPeerPatches(id) { if (peerPatches.delete(id)) pushPatches(); }
+  function repaintPeerPatches(id) {
+    const mine = peerPatches.get(id);
+    if (!mine || !mine.size) return;
+    const fill = fillFor(id);
+    for (const p of mine.values()) p.fill = fill;
+    pushPatches();
+  }
+  function pushPatches() {
+    if (!game.showPeerPatches) return;
+    const out = [];
+    for (const mine of peerPatches.values()) for (const p of mine.values()) out.push(p);
+    game.showPeerPatches(out);
+  }
+  function clearPeerPatches() { if (peerPatches.size) { peerPatches.clear(); pushPatches(); } }
+
+  // My own blocks inside the tile I am on, as the wire sees them.
+  function myTilePatches(tx, ty) {
+    const out = [];
+    const src = (game.myPatches && game.myPatches()) || [];
+    for (const p of src) {
+      if ((p.x >> TILE_BITS) !== tx || (p.y >> TILE_BITS) !== ty) continue;
+      out.push([p.x.toString(16), p.y.toString(16), p.c]);
+    }
+    return out;
+  }
+  // Sent when we arrive on a tile, and again — once, addressed with `re` — when somebody else
+  // arrives after us. `re` is what stops the two sides bouncing bulks off each other forever.
+  function sendBulk(re) {
+    if (!tileCh || tileX === null) return;
+    const all = myTilePatches(tileX, tileY);
+    for (let i = 0; i < all.length || i === 0; i += BULK_CHUNK) {
+      const ps = all.slice(i, i + BULK_CHUNK);
+      if (!ps.length && i > 0) break;
+      dbg("bulk ->", ps.length + " blocks", re ? "(reply to " + re + ")" : "(arrival)");
+      tileCh.send("bulk", { id: myId, re: re || "", ps });
+    }
+  }
+  let replyTimer = 0, served = new Set();
+  function serveNewcomer(id) {
+    if (served.has(id)) return;
+    served.add(id);
+    if (replyTimer) return;
+    replyTimer = setTimeout(() => { replyTimer = 0; sendBulk(id); }, REPLY_DELAY);
+  }
+  // Being ON the tile channel is the proximity check — a message cannot reach us from anywhere
+  // else — so there is no second "is this peer near?" test here to drift out of sync with it.
+  function onBulk(p) {
+    dbg("bulk <-", p && p.id, (p && p.ps && p.ps.length) + " blocks", p && p.re ? "(reply)" : "(arrival)");
+    if (!p || typeof p.id !== "string" || !ID_RE.test(p.id) || p.id === myId) return;
+    if (takePatches(p.id, p.ps)) pushPatches();
+    if (p.re === myId) served.add(p.id);                         // this WAS the answer to our arrival
+    else serveNewcomer(p.id);                                    // they just arrived — hand them ours
+  }
+  function onDig(p) {
+    dbg("dig <-", p && p.x + "," + p.y);
+    if (!p || typeof p.id !== "string" || !ID_RE.test(p.id) || p.id === myId) return;
+    if (takePatches(p.id, [[p.x, p.y, p.c]])) pushPatches();
+  }
+  // Called by the app when a scan of ours has committed. Free when nobody is watching.
+  function dug(patch) {
+    if (!tileCh || !joined || !nearIds.size) return;
+    if ((patch.x >> TILE_BITS) !== tileX || (patch.y >> TILE_BITS) !== tileY) return;
+    dbg("dig ->", patch.x + "," + patch.y, "c" + patch.c);
+    tileCh.send("dig", { id: myId, x: patch.x.toString(16), y: patch.y.toString(16), c: patch.c });
   }
 
   // ---- drawing ----
@@ -214,10 +385,15 @@ export async function initMultiplayer(game) {
     return [(x / q) * q, (y / q) * q];
   }
   function layout() {
+    // The camera moving is what changes which region you are in — a zoom with the mouse held
+    // still counts. layout() runs on every frame the map redraws, which is exactly that.
+    if (joined) checkTile();
     const w = game.stage.clientWidth, h = game.stage.clientHeight, cell = game.cellPx();
     for (const peer of peers.values()) {
       const p = peer.pos;
-      if (!p) { peer.el.style.display = "none"; continue; }
+      // Only players on our tile are drawn. Everyone else exists in the popover, which is how
+      // you go and find them; painting an arrow for a player 2^100 keys away is noise.
+      if (!p || !peer.near) { peer.el.style.display = "none"; continue; }
       let [px, py] = game.project(p.x, p.y, p.fx + peer.ox, p.fy + peer.oy);
       if (!Number.isFinite(px) || !Number.isFinite(py)) { peer.el.style.display = "none"; continue; }
       peer.el.style.display = "block";
@@ -225,8 +401,7 @@ export async function initMultiplayer(game) {
       peer.el.classList.toggle("edge", off);
       peer.el.classList.toggle("parked", p.parked);
       if (off) {
-        // Off screen: pin it to the border, pointing the way. The keyspace is 2^128 wide; without
-        // this nobody would ever find anyone.
+        // Off screen but on our tile: pin it to the border, pointing the way.
         const cx = w / 2, cy = h / 2;
         const ang = Math.atan2(py - cy, px - cx);
         if (!peer.tw) { peer.tw = peer.tag.offsetWidth; peer.th = peer.tag.offsetHeight; }   // the whole chip stays inside
@@ -281,37 +456,85 @@ export async function initMultiplayer(game) {
   const metaOf = () => (current ? { ...current, name: me.name, color: me.color } : { name: me.name, color: me.color });
   function flush() {
     trailTimer = 0;
-    if (!transport || !joined) return;
+    if (!joined) return;
     const { out, sig } = snapshot();
     if (sig === lastSig) return;
     lastSig = sig; lastSend = performance.now();
     current = { ...out, s: ++seq };
-    transport.move({ id: myId, ...current });
+    // Alone on the tile? Then a broadcast has no recipients and buys nothing. Presence still
+    // carries the settled position, so whoever arrives later sees where we are standing.
+    if (tileCh && nearIds.size) tileCh.send("pos", { id: myId, ...current });
     clearTimeout(settleTimer);
     settleTimer = setTimeout(settle, SETTLE);
   }
   function settle() {
     settleTimer = 0;
-    if (!transport || !joined || lastSig === trackedSig) return;
+    if (!joined || lastSig === trackedSig) return;
     const wait = RETRACK_EVERY - (performance.now() - lastTrack);
     if (wait > 0) { settleTimer = setTimeout(settle, wait); return; }
     trackedSig = lastSig; lastTrack = performance.now();
-    transport.update(metaOf());
+    const m = metaOf();
+    if (lobbyCh) lobbyCh.track(m);
+    if (tileCh) tileCh.track(m);
   }
   // called by the app whenever its pointer or camera may have moved — cheap when nothing did
   function pointerMoved() {
-    if (!joined || trailTimer) return;
+    if (!joined) return;
+    checkTile();
+    if (trailTimer) return;
     const wait = SEND_EVERY - (performance.now() - lastSend);
     if (wait <= 0) flush(); else trailTimer = setTimeout(flush, wait);
   }
 
+  // ---- tiles: which channel we belong on ----
+  const base = game.isLocal ? "keyspace-dev" : "keyspace";
+  let tileCh = null, tileX = null, tileY = null, tileTimer = 0;
+  // Which tile we are on is decided by the CAMERA, never by the cursor: the cursor crosses
+  // 10^36 keys per pixel when you are zoomed out, and a channel cannot follow that. Zoomed out
+  // far enough that the screen is wider than a whole tile, you are nowhere in particular —
+  // there is no "here" to share, so we hold no tile channel at all and cost nothing.
+  function tileOf() {
+    const v = game.view();
+    if (!v || !(v.span < TILE_SPAN)) return [null, null];
+    return [v.cx >> TILE_BITS, v.cy >> TILE_BITS];
+  }
+  function openTile(tx, ty) {
+    if (tileCh) { tileCh.close(); tileCh = null; }
+    for (const peer of peers.values()) peer.near = false;
+    nearIds = new Set();
+    clearPeerPatches();
+    served = new Set();
+    clearTimeout(replyTimer); replyTimer = 0;
+    tileX = tx; tileY = ty;
+    layout();
+    if (tx === null) { dbg("openTile none"); renderStatus(); return; }   // looking at the whole map: nowhere to be
+    const room = base + "-t" + tx.toString(16) + "_" + ty.toString(16);
+    dbg("openTile", room);
+    const mine = tileCh = transport.channel(room, {
+      presence: onTilePeers,
+      message: (ev, p) => { if (ev === "pos") onMove(p); else if (ev === "dig") onDig(p); else if (ev === "bulk") onBulk(p); },
+      status: (s) => { if ((s === "online" || s === "local") && tileCh === mine) sendBulk(""); },
+    });
+    tileCh.track(metaOf());
+  }
+  // Switching channel costs a subscribe and a bulk, so a cursor skimming over a tile border must
+  // not do it. Only a tile we are still on after TILE_SETTLE ms counts.
+  function checkTile() {
+    const [tx, ty] = tileOf();
+    if (tx === tileX && ty === tileY) { clearTimeout(tileTimer); tileTimer = 0; return; }
+    if (tileTimer) return;
+    tileTimer = setTimeout(() => {
+      tileTimer = 0;
+      const [nx, ny] = tileOf();
+      if (nx !== tileX || ny !== tileY) openTile(nx, ny);
+    }, TILE_SETTLE);
+  }
+
   // ---- connection lifecycle ----
-  let transport = null, joined = false, hideTimer = 0;
-  const cb = { peers: onPeers, move: onMove, status: (s) => { status = s; renderStatus(); } };
+  let transport = null, lobbyCh = null, joined = false, hideTimer = 0;
   renderStatus();                                    // "…" while supabase-js downloads
   try {
-    transport = useLocal ? localTransport("dev", cb)
-                         : await supabaseTransport(game.isLocal ? "keyspace-dev" : "keyspace", cb);
+    transport = useLocal ? localTransport() : await supabaseTransport();
   } catch (e) {
     status = "offline"; renderStatus();
     console.warn("multiplayer unavailable:", e);
@@ -322,14 +545,32 @@ export async function initMultiplayer(game) {
     joined = true;
     const { out, sig } = snapshot();
     current = { ...out, s: ++seq }; lastSig = trackedSig = sig; lastTrack = performance.now();
-    transport.join(metaOf());
+    lobbyCh = transport.channel(base, {
+      presence: onLobbyPeers,
+      message: () => {},                             // the lobby is presence only, by design
+      status: (s) => { status = s; renderStatus(); },
+    });
+    lobbyCh.track(metaOf());
+    const [tx, ty] = tileOf();
+    openTile(tx, ty);
   }
   function leave(paused) {
     if (!joined) return;
     joined = false;
-    clearTimeout(trailTimer); trailTimer = 0; clearTimeout(settleTimer); settleTimer = 0;
-    transport.leave();
-    if (paused) { status = "paused"; renderStatus(); }
+    clearTimeout(trailTimer); trailTimer = 0;
+    clearTimeout(settleTimer); settleTimer = 0;
+    clearTimeout(tileTimer); tileTimer = 0;
+    clearTimeout(replyTimer); replyTimer = 0;
+    if (tileCh) { tileCh.close(); tileCh = null; }
+    if (lobbyCh) { lobbyCh.close(); lobbyCh = null; }
+    tileX = tileY = null;
+    nearIds = new Set();
+    for (const peer of peers.values()) peer.el.remove();
+    peers.clear();
+    clearPeerPatches();
+    layout();
+    if (paused) { status = "paused"; }
+    renderStatus();
   }
   // A tab in the background still holds one of the free plan's 200 connections. Give it back
   // after a while and rejoin the moment the tab is looked at again.
@@ -348,10 +589,15 @@ export async function initMultiplayer(game) {
     wrap.hidden = false;
     const [txt, color, desc] = STATUS_TEXT[status] || STATUS_TEXT.offline;
     const n = peers.size + 1;
+    const near = nearIds.size;
     count.textContent = txt || String(n);
     count.style.color = color;
-    wrap.title = desc + (txt ? "" : " · " + n + " player" + (n > 1 ? "s" : "") + " on the map (you included) — click for the list");
-    statusEl.textContent = desc + (txt ? "" : " · " + n + " online");
+    // Zoomed out far enough and you are nowhere in particular, so there is nobody to be "here"
+    // with. Say so, otherwise an empty map reads as a broken connection.
+    const where = near ? " · " + near + " here with you"
+      : tileX === null && status === "online" ? " · zoom in to meet anyone" : "";
+    wrap.title = desc + (txt ? "" : " · " + n + " player" + (n > 1 ? "s" : "") + " on the map (you included)" + where + " — click for the list");
+    statusEl.textContent = desc + (txt ? "" : " · " + n + " online" + where);
     if (!menu.hidden) renderList();
   }
   function renderList() {
@@ -376,7 +622,10 @@ export async function initMultiplayer(game) {
       where.className = "pm-where";
       if (peer.pos) {
         const [px, py] = game.project(peer.pos.x, peer.pos.y, peer.pos.fx, peer.pos.fy);
-        where.textContent = px >= 0 && py >= 0 && px <= w && py <= h ? "on screen" : "fly there →";
+        const onScreen = peer.near && px >= 0 && py >= 0 && px <= w && py <= h;
+        where.textContent = onScreen ? "on screen" : "fly there →";
+        row.title = peer.near ? "on your tile — you can see each other's cursors and blocks"
+                              : "elsewhere on the map — fly over to meet them";
         row.addEventListener("click", () => { openMenu(false); game.travelTo(peer.pos.x, peer.pos.y); });
       } else { where.textContent = "—"; row.disabled = true; }
       row.append(dot, nm, where);
@@ -401,21 +650,28 @@ export async function initMultiplayer(game) {
   document.addEventListener("click", (e) => { if (!menu.hidden && !menu.contains(e.target)) openMenu(false); });
   window.addEventListener("keydown", (e) => { if (e.key === "Escape" && !menu.hidden) openMenu(false); });
   // Name and colour are rare, deliberate changes: they go out straight away, not on the settle timer.
+  function trackNow() {
+    if (!joined) return;
+    lastTrack = performance.now();
+    const m = metaOf();
+    if (lobbyCh) lobbyCh.track(m);
+    if (tileCh) tileCh.track(m);
+  }
   nameIn.addEventListener("change", () => {
     const v = nameIn.value.trim().slice(0, NAME_MAX);
     me.name = v || "anon-" + myId.slice(0, 4);
     nameIn.value = me.name;
     saveMe(me);
-    if (joined) { lastTrack = performance.now(); transport.update(metaOf()); }
+    trackNow();
   });
   nameIn.addEventListener("keydown", (e) => { if (e.key === "Enter") nameIn.blur(); });
   meDot.addEventListener("click", () => {
     me.color = (me.color + 1) % COLORS.length;
     saveMe(me); syncMe();
-    if (joined) { lastTrack = performance.now(); transport.update(metaOf()); }
+    trackNow();
   });
   syncMe();
   renderStatus();
 
-  return { layout, pointerMoved };
+  return { layout, pointerMoved, dug };
 }

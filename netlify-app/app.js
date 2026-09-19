@@ -73,6 +73,9 @@ let patches = [];                 // {x,y,c} solid scanned squares (current sess
 let seen = new Set();             // dedup "x,y,c"
 let grayPatches = [];             // territory carried over from soft resets (drawn gray)
 let graySeen = new Set();
+// Blocks other players dug on this tile: {x,y,c,fill}. Handed over by multiplayer.js, drawn and
+// nothing else — never counted, never saved, never exported, gone when you leave the tile.
+let peerPatches = [];
 let lastResetTime = 0, resetPending = false;   // 1× soft / 2× (<500ms) hard reset
 let heatImg = mmctx.createImageData(MM, MM);
 let keysScanned = 0;
@@ -328,6 +331,9 @@ function draw() {
   tctx.beginPath();
   tctx.rect(clipL, clipT, clipR - clipL, clipB - clipT);
   tctx.clip();
+  // Other players' territory, underneath everything of ours: tinted with their own colour so you
+  // can tell who has been digging here. Left out of the PNG export — that picture is your map.
+  if (!raw) for (const p of peerPatches) { tctx.fillStyle = p.fill; drawPatch(p); }
   // territory from past (soft-reset) sessions — desaturated gray, "we've been here"
   tctx.fillStyle = raw ? "#7a7a7a" : "rgba(102,106,116,0.5)";
   for (const p of grayPatches) drawPatch(p);
@@ -910,6 +916,7 @@ function commitPatch(checked, found) {
   $("#mPatches").textContent = patches.length.toLocaleString("en-US");
   refreshStats();
   render();
+  if (mp && mp.dug) mp.dug(p);          // tell whoever is standing here with us
 }
 
 // keysScanned ticks up honestly as the stream confirms keys (never the fictional pen²)
@@ -1867,10 +1874,10 @@ updateZoomDisplay();
 applyURLGoto();
 initCandidateDB().then(() => updateCandidateShelf());   // populate the shelf from prior sessions
 
-// ---------- multiplayer (phase 1: other players' cursors) ----------
+// ---------- multiplayer (cursors and dug blocks of whoever is on your tile) ----------
 // Loaded on its own and last, so a missing config, a blocked CDN or a bug in there can never
 // take the map down with it. It sees the map only through these few functions.
-import("./multiplayer.js?v=1")
+import("./multiplayer.js?v=2")
   .then((m) => m.initMultiplayer({
     stage, W, H, isLocal: IS_LOCAL,
     cellPx: () => cellPx,
@@ -1885,6 +1892,20 @@ import("./multiplayer.js?v=1")
     },
     project: (x, y, fx, fy) => [(Number(x - viewX) + fx) * cellPx - subX, (Number(y - viewY) + fy) * cellPx - subY],
     travelTo: (x, y) => travelTo(x, y, false),
+    // Where the CAMERA is and how much of the keyspace fits on screen. Multiplayer decides which
+    // region channel you belong on from this, not from the cursor: one pixel can be 10^36 keys.
+    view() {
+      const w = stage.clientWidth, h = stage.clientHeight;
+      const half = (n) => (cellPx > 0 && Number.isFinite(n / cellPx) ? BigInt(Math.floor(n / cellPx / 2)) : 0n);
+      return { cx: clampB(viewX + half(w), 0n, W - 1n),
+               cy: clampB(viewY + half(h), 0n, H - 1n),
+               // A stage that has not been laid out yet is not "a very small view of the map";
+               // it is no view at all, and must not read as one.
+               span: cellPx > 0 && w > 0 ? w / cellPx : Infinity };
+    },
+    // what we have dug this session, and where to put what the others have dug
+    myPatches: () => patches,
+    showPeerPatches: (list) => { peerPatches = list; render(); },
   }))
   .then((api) => { mp = api; if (mp) mp.layout(); })
   .catch((e) => console.warn("multiplayer failed to load:", e));
