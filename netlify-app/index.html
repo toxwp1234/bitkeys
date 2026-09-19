@@ -74,7 +74,8 @@
        and without labels people could not tell that a row is clickable or what the switch did. */
     .pm-sec{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
       padding:9px 4px 4px;border-top:1px solid var(--border);margin-top:7px}
-    #pmStatus + .pm-sec{border-top:0;margin-top:0;padding-top:0}
+    #peerMenu > .pm-sec:first-child{border-top:0;margin-top:0;padding-top:2px}
+    #pmStatus{padding-top:8px;border-top:1px solid var(--border);margin-top:7px}
     .pm-hint{font-size:9.5px;color:var(--muted);padding:3px 4px 0;line-height:1.45}
     /* two states side by side, the live one lit: a lone button cannot say whether its word is
        the current setting or the thing it would switch to */
@@ -511,11 +512,11 @@
   </div>
   <div id="resetToast"></div>
   <div id="peerMenu" hidden>
-    <div id="pmStatus">…</div>
-
-    <div class="pm-sec">you</div>
+    <div class="pm-sec">your name</div>
     <div class="pm-me"><span class="pm-dot" id="pmMeDot"></span><input id="pmName" maxlength="20" placeholder="your name" spellcheck="false" /></div>
-    <div class="pm-hint">the dot is your colour on everyone else's map — click it to change</div>
+    <div class="pm-hint">everyone nearby sees this · the dot is your colour — click it to change</div>
+
+    <div id="pmStatus">…</div>
 
     <div class="pm-sec" id="pmListLabel">players</div>
     <div id="pmList"></div>
