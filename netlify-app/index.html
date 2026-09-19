@@ -49,6 +49,53 @@
     .stats-row{flex:0 1 auto;min-width:0;overflow:hidden;display:flex;gap:14px;font-size:10.5px;color:var(--muted);align-items:center;white-space:nowrap;text-transform:uppercase;letter-spacing:.05em}
     .stats-row .stat{display:flex;gap:5px;align-items:baseline}
     .stats-row b{color:var(--accent);font-weight:600;font-family:var(--mono);font-size:12px;letter-spacing:0;text-transform:none}
+    /* online count: a stat that opens the players list */
+    header .stats-row button.stat-online{background:none;border:0;padding:0;border-radius:0;font:inherit;color:inherit;
+      text-transform:inherit;letter-spacing:inherit;cursor:pointer;display:flex;gap:5px;align-items:baseline}
+    header .stats-row button.stat-online[hidden]{display:none}
+    /* the name you wear on other players' maps — in the header rather than buried in a popover,
+       because it is the one multiplayer setting people want before they have clicked anything */
+    .stats-row .stat-name[hidden]{display:none}
+    .stats-row .stat-name input{width:92px;background:var(--panel2);border:1px solid var(--border);
+      color:var(--text);font-family:var(--mono);font-size:11px;font-weight:600;padding:2px 6px;
+      border-radius:6px;outline:none}
+    .stats-row .stat-name input:focus{border-color:var(--accent)}
+    header .stats-row button.stat-online:hover,header .stats-row button.stat-online.on{color:var(--text)}
+    #peerMenu{position:fixed;z-index:30;width:264px;background:var(--panel);border:1px solid var(--border);border-radius:11px;
+      padding:8px;box-shadow:0 14px 34px -12px rgba(0,0,0,.75);font-size:12px}
+    #peerMenu[hidden]{display:none}
+    #pmStatus{font-size:10px;color:var(--muted);padding:2px 4px 8px;line-height:1.4}
+    .pm-me{display:flex;align-items:center;gap:8px;padding:0 4px 8px;border-bottom:1px solid var(--border);margin-bottom:6px}
+    .pm-me input{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);
+      font-size:12px;padding:5px 7px;border-radius:7px;outline:none}
+    .pm-me input:focus{border-color:#3a4454}
+    .pm-dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto}
+    #pmMeDot{width:14px;height:14px;cursor:pointer;box-shadow:0 0 0 2px var(--panel2)}
+    #pmList{max-height:40vh;overflow:auto}
+    #peerMenu .pm-row{display:flex;align-items:center;gap:8px;width:100%;padding:6px 6px;border:1px solid transparent;border-radius:7px;
+      background:transparent;color:var(--text);font-size:12px;text-align:left}
+    #peerMenu .pm-row:hover:not(:disabled){background:var(--panel2);border-color:var(--border)}
+    .pm-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)}
+    .pm-empty{color:var(--muted);font-size:11px;padding:6px 4px}
+    /* The popover is three separate jobs — who you are, who else is here, how they are drawn —
+       and without labels people could not tell that a row is clickable or what the switch did. */
+    .pm-sec{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+      padding:9px 4px 4px;border-top:1px solid var(--border);margin-top:7px}
+    #peerMenu > .pm-sec:first-child{border-top:0;margin-top:0;padding-top:2px}
+    #pmStatus{padding-top:8px;border-top:1px solid var(--border);margin-top:7px}
+    .pm-hint{font-size:9.5px;color:var(--muted);padding:3px 4px 0;line-height:1.45}
+    /* two states side by side, the live one lit: a lone button cannot say whether its word is
+       the current setting or the thing it would switch to */
+    .pm-seg{display:flex;gap:4px;padding:1px 4px 0}
+    .pm-seg button{flex:1;font-size:10px;padding:5px 2px;white-space:nowrap;background:var(--panel2);
+      border:1px solid var(--border);color:var(--muted);border-radius:7px}
+    .pm-seg button:hover{color:var(--text);border-color:#3a4454}
+    .pm-seg button.on{background:rgba(247,147,26,.14);border-color:var(--accent);color:var(--accent)}
+    .pm-go{font-size:10px;color:var(--muted);white-space:nowrap;border:1px solid var(--border);border-radius:6px;
+      padding:2px 6px;background:var(--panel2)}
+    #peerMenu .pm-row:hover:not(:disabled) .pm-go{color:var(--accent);border-color:var(--accent)}
+    .pm-here{font-size:10px;color:var(--accent);white-space:nowrap}
+    .pm-foot{font-size:9.5px;color:var(--muted);padding:8px 4px 2px;border-top:1px solid var(--border);margin-top:6px;line-height:1.45}
     .separator{width:1px;height:26px;background:var(--border);flex:0 0 auto}
     .bar{flex:0 0 auto;display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
     /* scoped to the whole header, not .bar: the map group lives outside .bar, and with the
@@ -127,7 +174,7 @@
       header .sub{display:none}
     }
     @media (max-width:1050px){
-      .stats-row .stat:nth-child(3){display:none}
+      .stats-row .stat:nth-child(4){display:none}
       #posHud{font-size:8.5px;max-width:230px}
     }
     @media (max-width:900px){
@@ -158,6 +205,24 @@
     #posHud > div{display:flex;gap:6px}
     #posHud span{color:var(--accent);flex:0 0 auto;opacity:.75}
     #posHud b{font-weight:400;color:var(--text);min-width:0}
+    /* other players: DOM over the trail canvas, so they never end up in a PNG export */
+    #peers{position:absolute;inset:0;pointer-events:none;z-index:2;overflow:hidden}
+    .peer{position:absolute;top:0;left:0;will-change:transform;--pc:#4fb3ff}
+    .peer-dot{position:absolute;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;background:var(--pc);
+      box-shadow:0 0 0 1.5px rgba(10,12,16,.9),0 0 10px -1px var(--pc)}
+    .peer-pen{position:absolute;top:0;left:0;box-sizing:border-box;border:1px solid var(--pc);opacity:.75;
+      background:color-mix(in srgb,var(--pc) 14%,transparent)}
+    .peer-tag{position:absolute;left:8px;top:6px;display:flex;align-items:center;gap:4px;white-space:nowrap;font-family:var(--mono);
+      font-size:10px;line-height:1;color:#0a0c10;background:var(--pc);padding:3px 6px;border-radius:5px;max-width:160px}
+    .peer-name{overflow:hidden;text-overflow:ellipsis}
+    .peer-arrow{display:none;font-size:9px}
+    /* mouse off the map: the ring marks where they are looking, not where they are pointing */
+    .peer.parked .peer-dot{background:transparent;box-shadow:inset 0 0 0 2px var(--pc),0 0 0 1.5px rgba(10,12,16,.9)}
+    .peer.parked .peer-tag{opacity:.6}
+    .peer.edge .peer-pen{display:none!important}
+    .peer.edge .peer-dot{display:none}
+    .peer.edge .peer-tag{left:0;top:0;transform:translate(-50%,-50%);opacity:.85}
+    .peer.edge .peer-arrow{display:inline-block}
     .hint{position:absolute;left:14px;bottom:12px;color:var(--muted);font-size:12px;background:rgba(13,15,19,.7);padding:6px 10px;border-radius:8px;backdrop-filter:blur(4px)}
     /* on-screen zoom controls + scale indicator */
     #zoomCtl{position:absolute;right:14px;bottom:16px;display:flex;flex-direction:column;gap:6px;z-index:4}
@@ -296,9 +361,10 @@
       <div class="head-main">
         <div class="head-left">
           <div class="stats-row">
+            <button type="button" class="stat stat-online" id="statOnlineWrap" hidden>online <b id="statOnline">…</b></button>
             <span class="stat">keys <b id="statKeys">0</b></span>
             <span class="stat">rate <b id="statRate">0/s</b></span>
-            <span class="stat">found <b id="statFound">0</b></span>
+            <span class="stat stat-name" id="statNameWrap" hidden>name <input id="hdrName" maxlength="20" placeholder="anon" spellcheck="false" /></span>
           <span class="stat" id="statFilterWrap">filter <b id="statFilter">…</b></span>
           </div>
           <div class="separator"></div>
@@ -344,7 +410,7 @@
       <div id="cursor"></div>
       <div id="posHud"><div><span>X</span><b id="posX">0x0</b></div><div><span>Y</span><b id="posY">0x0</b></div></div>
       <div id="dot"></div>
-      <div class="hint">click = scan patch · drag = pan · scroll / buttons = zoom</div>
+      <div class="hint">left click = scan patch · drag = pan (right button never digs) · scroll / buttons = zoom</div>
       <div id="zoomLevel" style="position:absolute;right:14px;top:50px;font-size:12px;font-family:var(--mono);color:var(--text);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px);min-width:60px;text-align:right;transition:color .2s;z-index:4">1x</div>
       <div id="fpsCounter" style="position:absolute;right:14px;top:14px;font-size:11px;font-family:var(--mono);color:var(--accent);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px);min-width:60px;text-align:right">60 fps</div>
       <div id="precisionInfo" style="display:none;position:absolute;right:14px;top:50px;font-size:9px;font-family:var(--mono);color:var(--muted);background:rgba(13,15,19,.8);padding:6px 10px;border-radius:6px;backdrop-filter:blur(4px)">cell: 0.000×</div>
@@ -452,6 +518,26 @@
     </div>
   </div>
   <div id="resetToast"></div>
+  <div id="peerMenu" hidden>
+    <div class="pm-sec">your name</div>
+    <div class="pm-me"><span class="pm-dot" id="pmMeDot"></span><input id="pmName" maxlength="20" placeholder="your name" spellcheck="false" /></div>
+    <div class="pm-hint">everyone nearby sees this · the dot is your colour — click it to change</div>
+
+    <div id="pmStatus">…</div>
+
+    <div class="pm-sec" id="pmListLabel">players</div>
+    <div id="pmList"></div>
+    <div class="pm-hint" id="pmListHint" hidden>click a player to fly to them</div>
+
+    <div class="pm-sec">how their dug squares look on your map</div>
+    <div class="pm-seg" id="pmAlpha">
+      <button type="button" data-alpha="faded">faded</button>
+      <button type="button" data-alpha="solid">solid</button>
+      <button type="button" data-alpha="palette">my palette</button>
+    </div>
+
+    <div class="pm-foot">Shared with the players on your patch of the map: your cursor, name, brush size, which square you are drilling, and every square you finish with a count of how many keys the filter flagged in it. The keys and addresses themselves, and every balance, stay on this device.</div>
+  </div>
   <div id="candidateShelf">
     <div class="shelf-header">
       <div><span id="candidateCount">0</span> potential keys found · click to verify</div>

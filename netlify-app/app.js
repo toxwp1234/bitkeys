@@ -73,10 +73,16 @@ let patches = [];                 // {x,y,c} solid scanned squares (current sess
 let seen = new Set();             // dedup "x,y,c"
 let grayPatches = [];             // territory carried over from soft resets (drawn gray)
 let graySeen = new Set();
+// Squares other players dug on this tile: {x,y,c,h,color}. Handed over by multiplayer.js, drawn
+// and nothing else — never counted, never saved, never exported, gone when you leave the tile.
+// peerBusy is the square each of them is drilling RIGHT NOW, so nobody spends a minute scanning
+// 65,536 keys somebody else is already halfway through.
+let peerPatches = [], peerBusy = [], peerPatchMode = "faded";
 let lastResetTime = 0, resetPending = false;   // 1× soft / 2× (<500ms) hard reset
 let heatImg = mmctx.createImageData(MM, MM);
 let keysScanned = 0;
 let mouse = { x: 40, y: 40, inside: false };
+let mp = null;                    // multiplayer, once it has loaded (see the end of the file)
 
 const kAt = (x, y) => y * W + x + 1n;
 const toMMx = (x) => Number((x * MMb) / W);
@@ -210,35 +216,33 @@ const lastFrame = { grid: null, clip: null };
 let exportScale = 0, exportClean = false;   // what draw() last put on screen — read by snapshotMap()
 
 let pending = false;
-let frameCount = 0, lastFpsUpdate = 0, currentFps = 60;
-// This renderer is event-driven: it draws when something moves and stays idle otherwise.
-// Counting draws per second therefore measures HOW MUCH HAPPENED, not how fast the app is
-// — a still map legitimately reports single digits. So only report while frames are
-// actually being produced, and measure the busiest recent second rather than the last one.
-let fpsIdleSince = 0;
-function updateFps(now) {
-  if (now - lastFpsUpdate < 1000) return;
+// Counting how MANY frames went out measures how much happened, not how fast we are. This
+// renderer is event-driven — it draws when something moves and stays idle otherwise — so a
+// perfectly smooth map with one peer cursor easing across it honestly produced eight frames
+// that second, and "8 fps" is a true number answering a question nobody asked.
+// What is worth showing is the COST of a frame: how many we could sustain if we drew back to
+// back. That is the number that falls when the map gets heavy, which is the only moment this
+// counter earns its place in the header. Smoothed, and capped at the 60 Hz the browser will
+// hand us anyway — beyond that the figure would just be measuring an empty draw.
+const FPS_CEIL = 60;
+let frameCost = 1000 / FPS_CEIL, shownFps = 0;
+function updateFps(ms) {
+  frameCost += (ms - frameCost) * 0.15;              // EMA: one expensive frame is not the headline
   const el = $("#fpsCounter");
-  const span = (now - lastFpsUpdate) / 1000;
-  const rate = Math.round(frameCount / span);
-  frameCount = 0;
-  lastFpsUpdate = now;
   if (!el) return;
-  if (rate <= 2) {                                   // nothing is moving: not a frame rate
-    if (!fpsIdleSince) fpsIdleSince = now;
-    if (now - fpsIdleSince > 900) { el.style.color = "var(--muted)"; el.textContent = "idle"; }
-    return;
-  }
-  fpsIdleSince = 0;
-  currentFps = rate;
+  const rate = clampN(Math.round(1000 / Math.max(frameCost, 1000 / FPS_CEIL)), 1, FPS_CEIL);
+  if (rate === shownFps) return;                     // the header is rewritten only when it changes
+  shownFps = rate;
   el.style.color = rate >= 50 ? "var(--accent)" : rate >= 30 ? "#e0b155" : "#f0616d";
   el.textContent = rate + " fps";
+  el.title = "how many redraws a second the map could sustain (a redraw currently costs "
+           + frameCost.toFixed(1) + " ms). It does not count idle time: the map only draws when something moves.";
 }
-function render() { if (pending) return; pending = true; requestAnimationFrame((now) => {
-  frameCount++;
-  updateFps(now);
+function render() { if (pending) return; pending = true; requestAnimationFrame(() => {
   pending = false;
+  const t0 = performance.now();
   draw();
+  updateFps(performance.now() - t0);
 }); }
 
 function draw() {
@@ -327,6 +331,9 @@ function draw() {
   tctx.beginPath();
   tctx.rect(clipL, clipT, clipR - clipL, clipB - clipT);
   tctx.clip();
+  // Other players' territory, underneath everything of ours. Left out of the PNG export — that
+  // picture is your map.
+  if (!raw) for (const p of peerPatches) { tctx.fillStyle = peerFill(p); drawPatch(p); }
   // territory from past (soft-reset) sessions — desaturated gray, "we've been here"
   tctx.fillStyle = raw ? "#7a7a7a" : "rgba(102,106,116,0.5)";
   for (const p of grayPatches) drawPatch(p);
@@ -348,6 +355,24 @@ function draw() {
       tctx.strokeRect(sx + 0.5, sy + 0.5, sz - 1, sz - 1);
       tctx.restore();
     }
+  }
+  // Somebody else's drill, live. Same dashed square as your own so the shape already means
+  // "being scanned, not finished", but in their colour and with a faint wash, because the whole
+  // point is to be noticed from across the map before you click the same ground.
+  if (!raw && !exportClean && peerBusy.length) {
+    tctx.save();
+    tctx.setLineDash([5, 4]);
+    tctx.lineWidth = 2;
+    for (const b of peerBusy) {
+      const sz = b.c * cellPx;
+      const sx = Number(b.x - viewX) * cellPx - subX, sy = Number(b.y - viewY) * cellPx - subY;
+      if (!(sz >= 3) || sx > w || sy > h || sx + sz < 0 || sy + sz < 0) continue;
+      tctx.fillStyle = withAlpha(b.color, 0.12);
+      tctx.fillRect(sx, sy, sz, sz);
+      tctx.strokeStyle = b.color;
+      tctx.strokeRect(sx + 1, sy + 1, sz - 2, sz - 2);
+    }
+    tctx.restore();
   }
   if (home && !exportClean) {   // the checkpoint — same one-key shape as the landing marker, but white
     const hx = Number(home.x - viewX) * cellPx - subX;
@@ -377,6 +402,7 @@ function draw() {
     tctx.strokeRect(kx1 + 0.5, ky1 + 0.5, kx2 - kx1, ky2 - ky1);
   }
   positionCursor();
+  if (mp) mp.layout();          // other players follow the camera
   updateZoomUI();
   scheduleSave();
 }
@@ -434,6 +460,25 @@ function patchHeat(p) {
   return h > 0 ? clampN(Math.log1p(h) / HEAT_DENOM, 0, 1) : 0;
 }
 function patchFill(p) { return heatColor(patchHeat(p), 1); }
+// "#rrggbb" -> "rgba(r,g,b,a)". The parse is cached because a peer square asks for it on every
+// frame and there are only ever eight player colours.
+const RGB_CACHE = new Map();
+function withAlpha(hex, a) {
+  let rgb = RGB_CACHE.get(hex);
+  if (!rgb) {
+    const h = typeof hex === "string" && /^#[0-9a-f]{6}$/i.test(hex) ? hex : "#4fb3ff";
+    rgb = parseInt(h.slice(1, 3), 16) + "," + parseInt(h.slice(3, 5), 16) + "," + parseInt(h.slice(5, 7), 16);
+    RGB_CACHE.set(hex, rgb);
+  }
+  return "rgba(" + rgb + "," + a + ")";
+}
+// How another player's finished square is painted. Their colour keeps ownership legible; the
+// palette option gives that up on purpose, so a patch somebody else dug is coloured by what it
+// turned up exactly like one of yours and the map reads as a single picture.
+function peerFill(p) {
+  if (peerPatchMode === "palette") return patchFill(p);
+  return withAlpha(p.color, peerPatchMode === "solid" ? 1 : 0.28);
+}
 function heatColor(t, alpha, lift) {
   let i = 0;
   while (i < HEAT_RAMP.length - 2 && t > HEAT_RAMP[i + 1][0]) i++;
@@ -496,6 +541,7 @@ function positionCursor() {
     dot.classList.toggle("dot-void", inVoid(mx, my, keyRect()));
   }
 
+  if (mp) mp.pointerMoved();     // throttled inside; a no-op when nothing moved
   const [x, y] = cellUnder(mx, my);
   // The full key under the cursor, not a truncated one — a 256-bit number with its middle
   // cut out is not a number you can do anything with. Guarded so the DOM is not rewritten
@@ -563,6 +609,7 @@ function scanAt(x, y) {
                   pending: { x, y, c: penC, key } };   // becomes a real patch at scanDone
   lastScan = { k0, W, cols: penC };
   scanActive = true;
+  if (mp && mp.digging) mp.digging(pendingScan.pending);   // claim the square while it is being drilled
   balGen++; balBatch = { gen: balGen, total: 0, done: 0, funded: 0, failed: 0, scan: true };  // fresh balance session
   scanRevealed = false; verifyDone = false; hideChecking();   // fresh scan: nothing revealed / verified yet
   firstAddr = null;
@@ -880,6 +927,7 @@ worker.onmessage = (e) => {
     commitPatch(msg.checked, msg.foundCount);
     if (msg.display) renderPatchList(msg.display, msg.total, msg.bloomOn);
     scanActive = false;
+    if (mp && mp.digging) mp.digging(null);        // a no-op when commitPatch already announced it
     render(); scheduleSave();
     finishScanUI();
     return;
@@ -907,6 +955,7 @@ function commitPatch(checked, found) {
   $("#mPatches").textContent = patches.length.toLocaleString("en-US");
   refreshStats();
   render();
+  if (mp && mp.dug) mp.dug(p);          // tell whoever is standing here with us
 }
 
 // keysScanned ticks up honestly as the stream confirms keys (never the fictional pen²)
@@ -1036,24 +1085,33 @@ function elasticReturn() {
   if (!elasticRAF) elasticRAF = requestAnimationFrame(elasticStep);
 }
 
-// ---------- interaction: hover moves cursor, drag pans, click scans ----------
-let down = false, moved = false, lx = 0, ly = 0;
+// ---------- interaction: hover moves cursor, drag pans, LEFT click scans ----------
+// Any button pans; only the left one can ever dig. A dig is a commitment — it spends a scan,
+// paints territory and tells everyone nearby you are working that square — so hauling the map
+// around should not be one twitchy release away from starting one. Grab with the right button
+// and the map is a sheet of paper: it moves, and nothing else happens.
+let down = false, moved = false, panOnly = false, lx = 0, ly = 0;
 stage.addEventListener("mouseenter", () => { mouse.inside = true; });
 stage.addEventListener("mouseleave", () => { mouse.inside = false; positionCursor(); });
 stage.addEventListener("mousedown", (e) => {
   if (e.target.closest("#zoomCtl, #zoomScale")) return;   // clicks on the overlay controls aren't map scans
   stopZoom();                                             // grabbing the map cancels any approach in flight
   down = true; moved = false; lx = e.clientX; ly = e.clientY;
+  panOnly = e.button !== 0;
+  if (panOnly) e.preventDefault();                        // no middle-click autoscroll, no text selection
 });
+// A right-drag would otherwise finish in the browser's own menu, which is exactly the
+// interruption a pan-only button exists to avoid.
+stage.addEventListener("contextmenu", (e) => e.preventDefault());
 window.addEventListener("mouseup", (e) => {
-  if (down && !moved) {
+  if (down && !moved && !panOnly) {
     const r = stage.getBoundingClientRect();
     const mx = e.clientX - r.left, my = e.clientY - r.top;
     if (inVoid(mx, my, keyRect())) elasticReturn();   // clicked the void: pull the map back
     else if (homeArmed) { const [x, y] = cellUnder(mx, my); setHome(x, y); }
     else { const [x, y] = cellUnder(mx, my); scanAt(x, y); }
   }
-  down = false;
+  down = false; panOnly = false;
 });
 stage.addEventListener("mousemove", (e) => {
   const r = stage.getBoundingClientRect();
@@ -1216,23 +1274,6 @@ function travelTo(cx, cy, mark) {
   } });
 }
 
-// While the keyspace is still WIDER than the stage there is nothing to see outside it, so a
-// zoom step must not open a void gap on one side — otherwise the map hangs off an edge for
-// the whole way out and then snaps back the moment it finally fits. Panning into the void is
-// untouched; that is a deliberate move with its own elastic return.
-function clampZoomView() {
-  const w = stage.clientWidth, h = stage.clientHeight;
-  const { kx1, ky1, kx2, ky2 } = keyRect();
-  if (kx2 - kx1 > w) {
-    if (kx1 > 0) subX += kx1;
-    else if (kx2 < w) subX -= w - kx2;
-  }
-  if (ky2 - ky1 > h) {
-    if (ky1 > 0) subY += ky1;
-    else if (ky2 < h) subY -= h - ky2;
-  }
-}
-
 // Re-scale around (mx,my), keeping the key under that point pinned to the same pixel.
 function applyZoom(mx, my) {
   stopGlide();
@@ -1248,9 +1289,13 @@ function applyZoom(mx, my) {
   viewX = kx; subX = rx * cellPx - ax;
   viewY = ky; subY = ry * cellPx - ay;
   normalize();
-  clampZoomView();       // no void gap while the map is still bigger than the stage
-  centerKeyspace();      // self-gates on "does this axis fit?" — centre it the moment it does,
-  render();              // instead of waiting for the whole-space flag and jumping one notch later
+  // Zooming near an edge used to force the map flush against that edge on the same frame, and
+  // to jump dead-centre the instant the whole keyspace fitted. Both are correct resting places
+  // and both were reached in one step, which is what made a zoom by the border snap around
+  // under the cursor. They are the SAME resting places the elastic return already knows, so
+  // hand it the job: the key under the pointer stays pinned, and the map eases home behind it.
+  elasticReturn();
+  render();
   updateZoomDisplay();
 }
 // From whole space a single 1.15x notch is invisible — you'd need ~240 of them to see a
@@ -1318,6 +1363,7 @@ function showResetToast(msg) {
 }
 function cancelActiveWork() {                     // drop any in-flight scan + queued balance checks
   scanId++; pendingScan = null; scanActive = false; balGen++;
+  if (mp && mp.digging) mp.digging(null);         // take our marker off everyone else's map
   worker.postMessage({ type: "cancel" });
   hideChecking();                                  // tear down the live checking box on cancel/reset
 }
@@ -1405,10 +1451,13 @@ function syncPenPow() {
   const q = $("#penQuest");
   if (q) {
     const left = DIGS_PER_UNLOCK - penDigs;
-    q.innerHTML = penFree
+    const html = penFree
       ? "every brush unlocked · slider free"
       : "dig <b>" + left + "</b> more with pen <b>" + Math.pow(2, penExp) + "</b> → "
         + (penExp < PEN_TOP_EXP ? "pen " + Math.pow(2, penExp + 1) : "the slider");
+    // Dragging the slider fires setPen() on every pixel, and innerHTML is a parse each time
+    // even when the sentence is identical — which is exactly when the brush feels sticky.
+    if (html !== q._html) { q._html = html; q.innerHTML = html; }
   }
 }
 // called once per FRESH patch — re-digging old ground is not progress
@@ -1644,6 +1693,16 @@ function applyURLGoto() {
   const p = new URLSearchParams(location.search);
   if (p.has("x") && p.has("y")) { try { goTo(BigInt(p.get("x")), BigInt(p.get("y"))); } catch (e) {} }
 }
+// ?dev=1 — every brush preset and the free slider straight away, for testing something that
+// needs a big pen without digging thirty patches to earn one. It flips the same flags the
+// progression would have flipped, so like any other unlock it stays in the save afterwards.
+function applyDevMode() {
+  if (new URLSearchParams(location.search).get("dev") !== "1") return;
+  penExp = PEN_TOP_EXP; penDigs = 0; penFree = true;
+  setPen(Math.pow(2, PEN_TOP_EXP));
+  showResetToast("dev mode — every brush unlocked");
+  scheduleSave();
+}
 // cryptographically-random BigInt in [0, maxExclusive)
 function randBig(maxExclusive) {
   const bits = maxExclusive.toString(2).length;
@@ -1793,7 +1852,7 @@ document.addEventListener("click", (e) => { if (!themeMenu.hidden && !themeMenu.
 // The sidebar already carries these, but it scrolls and it is easy to lose. Up here they are
 // always in frame. Each writer guards on "did the text actually change", because positionCursor
 // runs every frame and the DOM should not.
-let statShown = { keys: "", rate: "", found: "" };
+let statShown = { keys: "", rate: "" };
 function setStat(name, value) {
   if (statShown[name] === value) return;
   statShown[name] = value;
@@ -1806,9 +1865,10 @@ function statsFound() {
   for (const p of patches) n += p.h || 0;
   return n;
 }
+// statsFound() has no header slot any more — the name box took it — but it still carries the
+// flagged count into the shared result text.
 function refreshStats() {
   setStat("keys", keysScanned.toLocaleString("en-US"));
-  setStat("found", statsFound().toLocaleString("en-US"));
 }
 
 // ---------- intro overlay ----------
@@ -1862,5 +1922,43 @@ resize();
 if (isWholeSpaceMode) zoomFit();
 updateZoomDisplay();
 applyURLGoto();
+applyDevMode();
 initCandidateDB().then(() => updateCandidateShelf());   // populate the shelf from prior sessions
+
+// ---------- multiplayer (cursors and dug blocks of whoever is on your tile) ----------
+// Loaded on its own and last, so a missing config, a blocked CDN or a bug in there can never
+// take the map down with it. It sees the map only through these few functions.
+import("./multiplayer.js?v=2")
+  .then((m) => m.initMultiplayer({
+    stage, W, H, isLocal: IS_LOCAL,
+    cellPx: () => cellPx,
+    // the key under the pointer — or, with the mouse off the map, the key it is orbiting
+    pointer() {
+      const parked = !mouse.inside;
+      const [mx, my] = parked ? focusPoint() : [mouse.x, mouse.y];
+      const ax = (mx + subX) / cellPx, ay = (my + subY) / cellPx;
+      const ix = Math.floor(ax), iy = Math.floor(ay);
+      return { x: clampB(viewX + BigInt(ix), 0n, W - 1n), y: clampB(viewY + BigInt(iy), 0n, H - 1n),
+               fx: cellPx >= 1 ? ax - ix : 0, fy: cellPx >= 1 ? ay - iy : 0, c: penC, parked };
+    },
+    project: (x, y, fx, fy) => [(Number(x - viewX) + fx) * cellPx - subX, (Number(y - viewY) + fy) * cellPx - subY],
+    travelTo: (x, y) => travelTo(x, y, false),
+    // Where the CAMERA is and how much of the keyspace fits on screen. Multiplayer decides which
+    // region channel you belong on from this, not from the cursor: one pixel can be 10^36 keys.
+    view() {
+      const w = stage.clientWidth, h = stage.clientHeight;
+      const half = (n) => (cellPx > 0 && Number.isFinite(n / cellPx) ? BigInt(Math.floor(n / cellPx / 2)) : 0n);
+      return { cx: clampB(viewX + half(w), 0n, W - 1n),
+               cy: clampB(viewY + half(h), 0n, H - 1n),
+               // A stage that has not been laid out yet is not "a very small view of the map";
+               // it is no view at all, and must not read as one.
+               span: cellPx > 0 && w > 0 ? w / cellPx : Infinity };
+    },
+    // what we have dug this session, and where to put what the others have dug
+    myPatches: () => patches,
+    showPeerPatches: (list, mode) => { peerPatches = list; peerPatchMode = mode || "faded"; render(); },
+    showPeerBusy: (list) => { peerBusy = list; render(); },
+  }))
+  .then((api) => { mp = api; if (mp) mp.layout(); })
+  .catch((e) => console.warn("multiplayer failed to load:", e));
 

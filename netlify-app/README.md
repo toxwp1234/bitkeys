@@ -35,3 +35,17 @@ Module workers need HTTP (not file://). From the repo root:
     derive.js          client-side key -> P2PKH address (secp256k1 + hashes + base58)
     derive.worker.js   runs derivation off the main thread
     vendor/            @noble/secp256k1 + @noble/hashes (self-contained ESM)
+    multiplayer.js     other players' cursors (Supabase Realtime, loaded lazily from jsDelivr)
+    multiplayer-config.js   Supabase project URL + publishable key (empty = multiplayer off)
+
+## Multiplayer (phase 1: cursors)
+Still no backend: the browser talks to Supabase Realtime directly, Netlify only serves files.
+Fill in `multiplayer-config.js` (Project URL + publishable/anon key — both public by design) and
+players see each other's cursors, an "online" count in the header, and a list to fly to anyone.
+
+- Movement goes over **Broadcast**, only while the pointer moves, at most every 300 ms.
+- **Presence** carries who is online plus a settled position, refreshed at most every 5 s.
+- A background tab disconnects after 30 s and rejoins when you look at it again.
+- On localhost the channel is `keyspace-dev`, so testing never shows up in production.
+- On localhost **without** keys (or with `?mp=local`) two tabs of the same browser see each
+  other through a `BroadcastChannel` — no Supabase project, no messages spent.
