@@ -185,7 +185,11 @@ export async function initMultiplayer(game) {
   const count = document.getElementById("statOnline");
   const menu = document.getElementById("peerMenu");
   const list = document.getElementById("pmList");
-  const nameIn = document.getElementById("pmName");
+  // The name lives in two places — the header box and the popover — because it is the one thing
+  // people want to set before they have clicked anything. Both drive the same value.
+  const nameIns = ["pmName", "hdrName"].map((id) => document.getElementById(id)).filter(Boolean);
+  const nameIn = nameIns[0];
+  const nameWrap = document.getElementById("statNameWrap");
   const meDot = document.getElementById("pmMeDot");
   const statusEl = document.getElementById("pmStatus");
   const alphaBtns = Array.from(document.querySelectorAll("#pmAlpha button"));
@@ -667,6 +671,7 @@ export async function initMultiplayer(game) {
 
   // ---- header: the online count and the players popover ----
   function renderStatus() {
+    if (nameWrap) nameWrap.hidden = false;
     if (!wrap) return;
     wrap.hidden = false;
     const [txt, color, desc] = STATUS_TEXT[status] || STATUS_TEXT.offline;
@@ -727,7 +732,7 @@ export async function initMultiplayer(game) {
     const r = wrap.getBoundingClientRect();
     menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - menu.offsetWidth - 8)) + "px";
     menu.style.top = r.bottom + 8 + "px";
-    nameIn.value = me.name;
+    syncName();
     renderList();
   }
   function syncMe() {
@@ -765,14 +770,19 @@ export async function initMultiplayer(game) {
     if (lobbyCh) lobbyCh.track(m);
     if (tileCh) tileCh.track(m);
   }
-  nameIn.addEventListener("change", () => {
-    const v = nameIn.value.trim().slice(0, NAME_MAX);
-    me.name = v || "anon-" + myId.slice(0, 4);
-    nameIn.value = me.name;
-    saveMe(me);
-    trackNow();
-  });
-  nameIn.addEventListener("keydown", (e) => { if (e.key === "Enter") nameIn.blur(); });
+  function syncName() { for (const el of nameIns) if (document.activeElement !== el) el.value = me.name; }
+  for (const el of nameIns) {
+    el.addEventListener("change", () => {
+      const v = el.value.trim().slice(0, NAME_MAX);
+      me.name = v || "anon-" + myId.slice(0, 4);
+      saveMe(me);
+      el.value = me.name;
+      syncName();
+      trackNow();
+    });
+    el.addEventListener("keydown", (e) => { if (e.key === "Enter") el.blur(); });
+  }
+  syncName();
   meDot.addEventListener("click", () => {
     me.color = (me.color + 1) % COLORS.length;
     saveMe(me); syncMe();

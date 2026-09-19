@@ -1852,7 +1852,7 @@ document.addEventListener("click", (e) => { if (!themeMenu.hidden && !themeMenu.
 // The sidebar already carries these, but it scrolls and it is easy to lose. Up here they are
 // always in frame. Each writer guards on "did the text actually change", because positionCursor
 // runs every frame and the DOM should not.
-let statShown = { keys: "", rate: "", found: "" };
+let statShown = { keys: "", rate: "" };
 function setStat(name, value) {
   if (statShown[name] === value) return;
   statShown[name] = value;
@@ -1865,9 +1865,10 @@ function statsFound() {
   for (const p of patches) n += p.h || 0;
   return n;
 }
+// statsFound() has no header slot any more — the name box took it — but it still carries the
+// flagged count into the shared result text.
 function refreshStats() {
   setStat("keys", keysScanned.toLocaleString("en-US"));
-  setStat("found", statsFound().toLocaleString("en-US"));
 }
 
 // ---------- intro overlay ----------

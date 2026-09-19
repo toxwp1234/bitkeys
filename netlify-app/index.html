@@ -53,6 +53,13 @@
     header .stats-row button.stat-online{background:none;border:0;padding:0;border-radius:0;font:inherit;color:inherit;
       text-transform:inherit;letter-spacing:inherit;cursor:pointer;display:flex;gap:5px;align-items:baseline}
     header .stats-row button.stat-online[hidden]{display:none}
+    /* the name you wear on other players' maps — in the header rather than buried in a popover,
+       because it is the one multiplayer setting people want before they have clicked anything */
+    .stats-row .stat-name[hidden]{display:none}
+    .stats-row .stat-name input{width:92px;background:var(--panel2);border:1px solid var(--border);
+      color:var(--text);font-family:var(--mono);font-size:11px;font-weight:600;padding:2px 6px;
+      border-radius:6px;outline:none}
+    .stats-row .stat-name input:focus{border-color:var(--accent)}
     header .stats-row button.stat-online:hover,header .stats-row button.stat-online.on{color:var(--text)}
     #peerMenu{position:fixed;z-index:30;width:264px;background:var(--panel);border:1px solid var(--border);border-radius:11px;
       padding:8px;box-shadow:0 14px 34px -12px rgba(0,0,0,.75);font-size:12px}
@@ -357,7 +364,7 @@
             <button type="button" class="stat stat-online" id="statOnlineWrap" hidden>online <b id="statOnline">…</b></button>
             <span class="stat">keys <b id="statKeys">0</b></span>
             <span class="stat">rate <b id="statRate">0/s</b></span>
-            <span class="stat">found <b id="statFound">0</b></span>
+            <span class="stat stat-name" id="statNameWrap" hidden>name <input id="hdrName" maxlength="20" placeholder="anon" spellcheck="false" /></span>
           <span class="stat" id="statFilterWrap">filter <b id="statFilter">…</b></span>
           </div>
           <div class="separator"></div>
