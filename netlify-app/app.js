@@ -1085,24 +1085,33 @@ function elasticReturn() {
   if (!elasticRAF) elasticRAF = requestAnimationFrame(elasticStep);
 }
 
-// ---------- interaction: hover moves cursor, drag pans, click scans ----------
-let down = false, moved = false, lx = 0, ly = 0;
+// ---------- interaction: hover moves cursor, drag pans, LEFT click scans ----------
+// Any button pans; only the left one can ever dig. A dig is a commitment — it spends a scan,
+// paints territory and tells everyone nearby you are working that square — so hauling the map
+// around should not be one twitchy release away from starting one. Grab with the right button
+// and the map is a sheet of paper: it moves, and nothing else happens.
+let down = false, moved = false, panOnly = false, lx = 0, ly = 0;
 stage.addEventListener("mouseenter", () => { mouse.inside = true; });
 stage.addEventListener("mouseleave", () => { mouse.inside = false; positionCursor(); });
 stage.addEventListener("mousedown", (e) => {
   if (e.target.closest("#zoomCtl, #zoomScale")) return;   // clicks on the overlay controls aren't map scans
   stopZoom();                                             // grabbing the map cancels any approach in flight
   down = true; moved = false; lx = e.clientX; ly = e.clientY;
+  panOnly = e.button !== 0;
+  if (panOnly) e.preventDefault();                        // no middle-click autoscroll, no text selection
 });
+// A right-drag would otherwise finish in the browser's own menu, which is exactly the
+// interruption a pan-only button exists to avoid.
+stage.addEventListener("contextmenu", (e) => e.preventDefault());
 window.addEventListener("mouseup", (e) => {
-  if (down && !moved) {
+  if (down && !moved && !panOnly) {
     const r = stage.getBoundingClientRect();
     const mx = e.clientX - r.left, my = e.clientY - r.top;
     if (inVoid(mx, my, keyRect())) elasticReturn();   // clicked the void: pull the map back
     else if (homeArmed) { const [x, y] = cellUnder(mx, my); setHome(x, y); }
     else { const [x, y] = cellUnder(mx, my); scanAt(x, y); }
   }
-  down = false;
+  down = false; panOnly = false;
 });
 stage.addEventListener("mousemove", (e) => {
   const r = stage.getBoundingClientRect();
