@@ -91,23 +91,37 @@ and an incoming message cannot have come from anywhere else.
 
 ### Sharing the dug blocks
 
-- A shared block is three numbers: `x`, `y` and the brush size `c`. Nothing else — no key, no
-  balance, no candidate, no count of what you flagged.
+- A shared block is four numbers: `x`, `y`, the brush size `c`, and `h` — how many of its keys
+  the sender's Bloom filter flagged. `h` is what tints a square, so without it another player's
+  ground cannot be drawn in your palette. It is a count of maybes: no key, no address, no
+  balance, and nothing that says whether anything was actually there.
 - **On arriving** on a tile you broadcast a `bulk` of your own blocks in it (an empty one still
   goes out: it is also "hello"). Anyone already there answers with one `bulk` of their own,
   addressed with `re: <your id>`. That `re` is what stops the two sides bouncing bulks off each
   other forever — the whole exchange is two messages.
 - **After that**, each block you dig goes out as a single `dig` — and only if somebody is
   actually on your tile. Alone, the feature is completely silent.
-- Blocks you receive are **display only**: drawn under your own territory, tinted with the
-  owner's colour, and left out of `Save as PNG`. They never touch `keysScanned`, the found
-  counter or pen progression (`creditDig`), they are never saved, and they are dropped the moment
-  that player leaves your tile or you leave it yourself.
+- **While a scan is running** the square goes out as `busy`, and comes down again when the `dig`
+  for it arrives (a finished square is its own "done here") or on an explicit empty `busy` if the
+  scan was abandoned. A 65,536-key dig takes long enough that waiting for it to finish before
+  showing anything would be far too late: two people would already be scanning the same ground.
+  Receivers draw it as the same dashed square the app uses for its own drill, in the digger's
+  colour, and drop it after `BUSY_TTL` if nothing ever ends it.
+- Blocks you receive are **display only**: drawn under your own territory and left out of
+  `Save as PNG`. They never touch `keysScanned`, the found counter or pen progression
+  (`creditDig`), they are never saved, and they are dropped the moment that player leaves your
+  tile or you leave it yourself.
+- **How they look is yours to choose** (players popover, remembered per browser): `faded` and
+  `solid` paint them in the owner's colour, so you can always tell whose ground you are looking
+  at; `palette` runs them through your own heat ramp exactly like your own squares — one picture
+  instead of two, at the cost of the map no longer saying who dug what. The app owns the ramp, so
+  `multiplayer.js` hands over `{x,y,c,h,color}` plus the mode and lets `draw()` decide. The live
+  `busy` markers stay in the digger's colour in every mode: that one is about *who*, not *what*.
 - Everything incoming is untrusted. Ids and 128-bit coordinates are regex- and range-checked, a
-  brush size must be a power of two, names are capped and written with `textContent`, colours are
-  an index into a fixed palette, and a peer can hold at most `PEER_PATCH_CAP` blocks. The worst a
-  liar can do is paint squares on your screen until you walk away. Keep it that way when adding
-  fields.
+  brush size must be a power of two, `h` is clamped to the square's own key count, names are
+  capped and written with `textContent`, colours are an index into a fixed palette, and a peer can
+  hold at most `PEER_PATCH_CAP` blocks. The worst a liar can do is paint squares on your screen
+  until you walk away. Keep it that way when adding fields.
 
 ### The rest of the machinery
 
@@ -116,15 +130,17 @@ and an incoming message cannot have come from anywhere else.
   that way.
 - The map exposes exactly one object and nothing else:
   `{ stage, W, H, isLocal, cellPx(), pointer(), view(), project(), travelTo(), myPatches(),
-  showPeerPatches() }`. All map internals (`viewX`, `subX`, zoom, BigInt maths) stay in `app.js`.
-- `multiplayer.js` returns `{ layout, pointerMoved, dug }`. `draw()` calls `layout()` so peers
-  follow the camera *and* so a zoom with the mouse held still still changes your tile;
-  `positionCursor()` calls `pointerMoved()`; `commitPatch()` calls `dug()`.
+  showPeerPatches(), showPeerBusy() }`. All map internals (`viewX`, `subX`, zoom, BigInt maths)
+  stay in `app.js`.
+- `multiplayer.js` returns `{ layout, pointerMoved, dug, digging }`. `draw()` calls `layout()` so
+  peers follow the camera *and* so a zoom with the mouse held still still changes your tile;
+  `positionCursor()` calls `pointerMoved()`; a scan calls `digging()` when it starts and
+  `commitPatch()` calls `dug()` when it lands.
 - **Two transports behind one interface.** A transport hands out channels, each
   `{ track(meta), send(event, payload), close() }`, reporting through
   `{ presence, message, status }`:
-  - **Supabase** — Presence for who is there, Broadcast for `pos`, `dig` and `bulk`. supabase-js
-    multiplexes every channel over one websocket, so lobby + region is still one connection.
+  - **Supabase** — Presence for who is there, Broadcast for `pos`, `dig`, `bulk` and `busy`.
+    supabase-js multiplexes every channel over one websocket, so lobby + region is one connection.
   - **BroadcastChannel** — localhost only, when no keys are configured (or `?mp=local`). Tabs of
     one browser see each other, zero Supabase messages.
   Adding a feature means adding an **event**, never a third transport — otherwise the local test

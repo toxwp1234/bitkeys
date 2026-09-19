@@ -33,10 +33,12 @@ const EASE_MS = 90;            // interpolation time constant on the receiving s
 const NAME_MAX = 20;
 const ME_STORE = "cuvre-player-v1";
 const ALPHA_STORE = "cuvre-peer-alpha-v1";
-// How loudly other players' squares are painted. Faded reads as "someone else's, and not in your
-// way"; solid gives the map one consistent weight, so a dug area looks dug whoever dug it. Either
-// way the square carries the owner's colour, and either way it stays under your own territory.
-const PEER_ALPHA = { faded: 0.28, solid: 1 };
+// How other players' squares are painted on your map. "faded" and "solid" both carry the owner's
+// colour, so you can always tell whose ground you are looking at; "palette" drops that and runs
+// them through your own heat ramp exactly like your own squares, which is the only way the map
+// reads as one picture instead of two. The app owns the ramp, so the choice is passed to it.
+const PEER_MODES = ["faded", "solid", "palette"];
+const BUSY_TTL = 60000;        // forget a peer's "digging here" marker if nothing ends it
 // A tile is 2^64 keys a side — 1.8e19 of them across the map, so two players share one only
 // when they meant to, and once they do it takes a deliberate journey to leave it again.
 // It is deliberately huge: at any but the deepest zoom, one screen pixel is already millions of
@@ -47,7 +49,7 @@ const TILE_SETTLE = 1200;      // ms on a new tile before we actually switch cha
 const BULK_CHUNK = 600;        // blocks per bulk message — the payload cap is 256 KB
 const PEER_PATCH_CAP = 4000;   // per peer, per tile; a flood cannot grow our memory without bound
 const REPLY_DELAY = 400;       // ms to coalesce "someone new arrived, send them my blocks"
-const EVENTS = ["pos", "dig", "bulk"];
+const EVENTS = ["pos", "dig", "bulk", "busy"];
 // Never the app's own orange: that is YOUR cursor.
 const COLORS = ["#4fb3ff", "#3fd68a", "#ff6b9a", "#b58cff", "#ffd84f", "#4fe0d2", "#ff8a5c", "#c7e05a"];
 
@@ -80,7 +82,7 @@ function saveMe(me) { try { localStorage.setItem(ME_STORE, JSON.stringify(me)); 
 function loadAlphaMode() {
   let s = null;
   try { s = localStorage.getItem(ALPHA_STORE); } catch (e) {}
-  return s === "solid" ? "solid" : "faded";
+  return PEER_MODES.indexOf(s) >= 0 ? s : "faded";
 }
 
 // ---------- transports ----------
@@ -226,7 +228,7 @@ export async function initMultiplayer(game) {
     const name = typeof m.name === "string" && m.name.trim() ? m.name.trim().slice(0, NAME_MAX) : "anon";
     if (name !== peer.name) { peer.name = name; peer.nameEl.textContent = name; peer.tw = 0; }   // textContent: names are untrusted
     const color = Number.isInteger(m.color) && m.color >= 0 && m.color < COLORS.length ? m.color : 0;
-    if (color !== peer.color) { peer.color = color; peer.el.style.setProperty("--pc", COLORS[color]); repaintPeerPatches(peer.id); }
+    if (color !== peer.color) { peer.color = color; peer.el.style.setProperty("--pc", COLORS[color]); pushPatches(); pushBusy(); }
   }
   function setPos(peer, pos) {
     if (!pos || pos.s < peer.s) return;              // a settled presence position older than the live one
@@ -287,17 +289,11 @@ export async function initMultiplayer(game) {
   // ---- incoming: dug blocks ----
   // Everything here is untrusted. A block is four numbers and nothing else; it is drawn and never
   // counted, so the worst a liar can do is paint squares on your screen until you leave the tile.
-  const peerPatches = new Map();                     // id -> Map("xhex,yhex,c" -> {x,y,c,fill})
+  const peerPatches = new Map();                     // id -> Map("xhex,yhex,c" -> {x,y,c,h})
+  const peerBusy = new Map();                        // id -> {x,y,c,at} — the square they are drilling NOW
   let nearIds = new Set();
-  function fillFor(id) {
-    const peer = peers.get(id);
-    const hex = COLORS[peer && peer.color >= 0 ? peer.color : 0];
-    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
-    return "rgba(" + r + "," + g + "," + b + "," + PEER_ALPHA[alphaMode] + ")";
-  }
-  function parsePatch(a) {
-    if (!Array.isArray(a) || a.length < 3) return null;
-    const [xs, ys, c] = a;
+  const colorOf = (id) => { const p = peers.get(id); return COLORS[p && p.color >= 0 ? p.color : 0]; };
+  function parseSquare(xs, ys, c) {
     if (typeof xs !== "string" || typeof ys !== "string" || !HEX_RE.test(xs) || !HEX_RE.test(ys)) return null;
     const n = Math.floor(Number(c));
     if (!Number.isFinite(n) || n < 1 || n > 2 ** 40 || (n & (n - 1)) !== 0) return null;   // a brush is a power of two
@@ -305,41 +301,62 @@ export async function initMultiplayer(game) {
     if (x >= game.W || y >= game.H) return null;
     return { key: xs + "," + ys + "," + n, x, y, c: n };
   }
+  function parsePatch(a) {
+    if (!Array.isArray(a) || a.length < 3) return null;
+    const p = parseSquare(a[0], a[1], a[2]);
+    if (!p) return null;
+    // h is how many keys the sender's Bloom filter flagged in that square. It is what tints the
+    // square in your own palette, and it is a count of maybes — no key, no address, no balance.
+    const h = Math.floor(Number(a[3]));
+    p.h = Number.isFinite(h) && h > 0 ? Math.min(h, p.c * p.c) : 0;
+    return p;
+  }
   function takePatches(id, arr) {
     if (!Array.isArray(arr) || !arr.length) return false;
     let mine = peerPatches.get(id);
     if (!mine) { mine = new Map(); peerPatches.set(id, mine); }
-    const fill = fillFor(id);
     let added = false;
     for (const a of arr) {
       if (mine.size >= PEER_PATCH_CAP) break;
       const p = parsePatch(a);
-      if (!p || mine.has(p.key)) continue;
-      p.fill = fill;
+      if (!p) continue;
+      const old = mine.get(p.key);
+      if (old && old.h === p.h) continue;
       mine.set(p.key, p);
       added = true;
     }
     return added;
   }
-  function forgetPeerPatches(id) { if (peerPatches.delete(id)) pushPatches(); }
-  function repaintPeerPatches(id) {
-    const mine = peerPatches.get(id);
-    if (!mine || !mine.size) return;
-    const fill = fillFor(id);
-    for (const p of mine.values()) p.fill = fill;
-    pushPatches();
+  function forgetPeerPatches(id) {
+    const had = peerPatches.delete(id);
+    if (peerBusy.delete(id)) pushBusy();
+    if (had) pushPatches();
   }
-  function repaintAll() {
-    for (const [id, mine] of peerPatches) { const fill = fillFor(id); for (const p of mine.values()) p.fill = fill; }
-    pushPatches();
-  }
+  // The owner's colour is attached here rather than stored per square, so a peer changing colour
+  // — or you changing how their ground is painted — is one push, not a sweep.
   function pushPatches() {
     if (!game.showPeerPatches) return;
     const out = [];
-    for (const mine of peerPatches.values()) for (const p of mine.values()) out.push(p);
-    game.showPeerPatches(out);
+    for (const [id, mine] of peerPatches) {
+      const color = colorOf(id);
+      for (const p of mine.values()) out.push({ x: p.x, y: p.y, c: p.c, h: p.h, color });
+    }
+    game.showPeerPatches(out, alphaMode);
   }
-  function clearPeerPatches() { if (peerPatches.size) { peerPatches.clear(); pushPatches(); } }
+  function pushBusy() {
+    if (!game.showPeerBusy) return;
+    const now = Date.now();
+    const out = [];
+    for (const [id, b] of peerBusy) {
+      if (now - b.at > BUSY_TTL) { peerBusy.delete(id); continue; }   // a scan that never reported back
+      out.push({ x: b.x, y: b.y, c: b.c, color: colorOf(id) });
+    }
+    game.showPeerBusy(out);
+  }
+  function clearPeerPatches() {
+    if (peerPatches.size) { peerPatches.clear(); pushPatches(); }
+    if (peerBusy.size) { peerBusy.clear(); pushBusy(); }
+  }
 
   // My own blocks inside the tile I am on, as the wire sees them.
   function myTilePatches(tx, ty) {
@@ -347,7 +364,7 @@ export async function initMultiplayer(game) {
     const src = (game.myPatches && game.myPatches()) || [];
     for (const p of src) {
       if ((p.x >> TILE_BITS) !== tx || (p.y >> TILE_BITS) !== ty) continue;
-      out.push([p.x.toString(16), p.y.toString(16), p.c]);
+      out.push([p.x.toString(16), p.y.toString(16), p.c, p.h || 0]);
     }
     return out;
   }
@@ -382,14 +399,43 @@ export async function initMultiplayer(game) {
   function onDig(p) {
     dbg("dig <-", p && p.x + "," + p.y);
     if (!p || typeof p.id !== "string" || !ID_RE.test(p.id) || p.id === myId) return;
-    if (takePatches(p.id, [[p.x, p.y, p.c]])) pushPatches();
+    // A finished square is its own "I am done here" — no second message needed to take the
+    // drilling marker down.
+    if (peerBusy.delete(p.id)) pushBusy();
+    if (takePatches(p.id, [[p.x, p.y, p.c, p.h]])) pushPatches();
+  }
+  function onBusy(p) {
+    if (!p || typeof p.id !== "string" || !ID_RE.test(p.id) || p.id === myId) return;
+    const q = p.x === undefined ? null : parseSquare(p.x, p.y, p.c);
+    dbg("busy <-", p.id, q ? q.x + "," + q.y : "cleared");
+    if (q) peerBusy.set(p.id, { x: q.x, y: q.y, c: q.c, at: Date.now() });
+    else if (!peerBusy.delete(p.id)) return;
+    pushBusy();
   }
   // Called by the app when a scan of ours has committed. Free when nobody is watching.
   function dug(patch) {
+    myBusy = null;                                   // the dig message below says it for us
     if (!tileCh || !joined || !nearIds.size) return;
     if ((patch.x >> TILE_BITS) !== tileX || (patch.y >> TILE_BITS) !== tileY) return;
     dbg("dig ->", patch.x + "," + patch.y, "c" + patch.c);
-    tileCh.send("dig", { id: myId, x: patch.x.toString(16), y: patch.y.toString(16), c: patch.c });
+    tileCh.send("dig", { id: myId, x: patch.x.toString(16), y: patch.y.toString(16), c: patch.c, h: patch.h || 0 });
+  }
+  // Called the moment a scan STARTS, and with null when one is abandoned. Two people digging the
+  // same square is the one thing this whole feature exists to prevent, and a 65,536-key dig is
+  // long enough that "it will show up when it finishes" is far too late to be useful.
+  let myBusy = null;
+  function digging(q) {
+    if (!q) {
+      if (!myBusy) return;
+      myBusy = null;
+      if (tileCh && joined && nearIds.size) tileCh.send("busy", { id: myId });
+      return;
+    }
+    if ((q.x >> TILE_BITS) !== tileX || (q.y >> TILE_BITS) !== tileY) { myBusy = null; return; }
+    myBusy = q;
+    if (!tileCh || !joined || !nearIds.size) return;
+    dbg("busy ->", q.x + "," + q.y, "c" + q.c);
+    tileCh.send("busy", { id: myId, x: q.x.toString(16), y: q.y.toString(16), c: q.c });
   }
 
   // ---- drawing ----
@@ -530,7 +576,12 @@ export async function initMultiplayer(game) {
     dbg("openTile", room);
     const mine = tileCh = transport.channel(room, {
       presence: onTilePeers,
-      message: (ev, p) => { if (ev === "pos") onMove(p); else if (ev === "dig") onDig(p); else if (ev === "bulk") onBulk(p); },
+      message: (ev, p) => {
+        if (ev === "pos") onMove(p);
+        else if (ev === "dig") onDig(p);
+        else if (ev === "bulk") onBulk(p);
+        else if (ev === "busy") onBusy(p);
+      },
       status: (s) => { if ((s === "online" || s === "local") && tileCh === mine) sendBulk(""); },
     });
     tileCh.track(metaOf());
@@ -670,21 +721,25 @@ export async function initMultiplayer(game) {
     meDot.style.background = COLORS[me.color];
     meDot.title = "your colour — click to change";
   }
+  const MODE_TITLE = {
+    faded: "their colour, faded — your own territory reads first",
+    solid: "their colour, solid — you can still tell whose ground it is",
+    palette: "your own palette, tinted by what the square turned up — the map reads as one picture, "
+           + "but nothing on it says who dug what",
+  };
   function syncAlpha() {
     for (const b of alphaBtns) {
-      const on = b.dataset.alpha === alphaMode;
-      b.classList.toggle("on", on);
-      b.title = b.dataset.alpha === "solid"
-        ? "paint their squares as solidly as your own, so a jointly dug area reads as one"
-        : "paint their squares faded, so your own territory reads first";
+      b.classList.toggle("on", b.dataset.alpha === alphaMode);
+      b.title = MODE_TITLE[b.dataset.alpha] || "";
     }
   }
   for (const b of alphaBtns) b.addEventListener("click", () => {
-    if (b.dataset.alpha === alphaMode) return;
-    alphaMode = b.dataset.alpha === "solid" ? "solid" : "faded";
+    const m = b.dataset.alpha;
+    if (m === alphaMode || PEER_MODES.indexOf(m) < 0) return;
+    alphaMode = m;
     try { localStorage.setItem(ALPHA_STORE, alphaMode); } catch (e) {}
     syncAlpha();
-    repaintAll();
+    pushPatches();
   });
   wrap.addEventListener("click", (e) => { e.stopPropagation(); openMenu(menu.hidden); });
   document.addEventListener("click", (e) => { if (!menu.hidden && !menu.contains(e.target)) openMenu(false); });
@@ -714,5 +769,5 @@ export async function initMultiplayer(game) {
   syncAlpha();
   renderStatus();
 
-  return { layout, pointerMoved, dug };
+  return { layout, pointerMoved, dug, digging };
 }

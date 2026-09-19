@@ -73,9 +73,11 @@ let patches = [];                 // {x,y,c} solid scanned squares (current sess
 let seen = new Set();             // dedup "x,y,c"
 let grayPatches = [];             // territory carried over from soft resets (drawn gray)
 let graySeen = new Set();
-// Blocks other players dug on this tile: {x,y,c,fill}. Handed over by multiplayer.js, drawn and
-// nothing else — never counted, never saved, never exported, gone when you leave the tile.
-let peerPatches = [];
+// Squares other players dug on this tile: {x,y,c,h,color}. Handed over by multiplayer.js, drawn
+// and nothing else — never counted, never saved, never exported, gone when you leave the tile.
+// peerBusy is the square each of them is drilling RIGHT NOW, so nobody spends a minute scanning
+// 65,536 keys somebody else is already halfway through.
+let peerPatches = [], peerBusy = [], peerPatchMode = "faded";
 let lastResetTime = 0, resetPending = false;   // 1× soft / 2× (<500ms) hard reset
 let heatImg = mmctx.createImageData(MM, MM);
 let keysScanned = 0;
@@ -329,9 +331,9 @@ function draw() {
   tctx.beginPath();
   tctx.rect(clipL, clipT, clipR - clipL, clipB - clipT);
   tctx.clip();
-  // Other players' territory, underneath everything of ours: tinted with their own colour so you
-  // can tell who has been digging here. Left out of the PNG export — that picture is your map.
-  if (!raw) for (const p of peerPatches) { tctx.fillStyle = p.fill; drawPatch(p); }
+  // Other players' territory, underneath everything of ours. Left out of the PNG export — that
+  // picture is your map.
+  if (!raw) for (const p of peerPatches) { tctx.fillStyle = peerFill(p); drawPatch(p); }
   // territory from past (soft-reset) sessions — desaturated gray, "we've been here"
   tctx.fillStyle = raw ? "#7a7a7a" : "rgba(102,106,116,0.5)";
   for (const p of grayPatches) drawPatch(p);
@@ -353,6 +355,24 @@ function draw() {
       tctx.strokeRect(sx + 0.5, sy + 0.5, sz - 1, sz - 1);
       tctx.restore();
     }
+  }
+  // Somebody else's drill, live. Same dashed square as your own so the shape already means
+  // "being scanned, not finished", but in their colour and with a faint wash, because the whole
+  // point is to be noticed from across the map before you click the same ground.
+  if (!raw && !exportClean && peerBusy.length) {
+    tctx.save();
+    tctx.setLineDash([5, 4]);
+    tctx.lineWidth = 2;
+    for (const b of peerBusy) {
+      const sz = b.c * cellPx;
+      const sx = Number(b.x - viewX) * cellPx - subX, sy = Number(b.y - viewY) * cellPx - subY;
+      if (!(sz >= 3) || sx > w || sy > h || sx + sz < 0 || sy + sz < 0) continue;
+      tctx.fillStyle = withAlpha(b.color, 0.12);
+      tctx.fillRect(sx, sy, sz, sz);
+      tctx.strokeStyle = b.color;
+      tctx.strokeRect(sx + 1, sy + 1, sz - 2, sz - 2);
+    }
+    tctx.restore();
   }
   if (home && !exportClean) {   // the checkpoint — same one-key shape as the landing marker, but white
     const hx = Number(home.x - viewX) * cellPx - subX;
@@ -440,6 +460,25 @@ function patchHeat(p) {
   return h > 0 ? clampN(Math.log1p(h) / HEAT_DENOM, 0, 1) : 0;
 }
 function patchFill(p) { return heatColor(patchHeat(p), 1); }
+// "#rrggbb" -> "rgba(r,g,b,a)". The parse is cached because a peer square asks for it on every
+// frame and there are only ever eight player colours.
+const RGB_CACHE = new Map();
+function withAlpha(hex, a) {
+  let rgb = RGB_CACHE.get(hex);
+  if (!rgb) {
+    const h = typeof hex === "string" && /^#[0-9a-f]{6}$/i.test(hex) ? hex : "#4fb3ff";
+    rgb = parseInt(h.slice(1, 3), 16) + "," + parseInt(h.slice(3, 5), 16) + "," + parseInt(h.slice(5, 7), 16);
+    RGB_CACHE.set(hex, rgb);
+  }
+  return "rgba(" + rgb + "," + a + ")";
+}
+// How another player's finished square is painted. Their colour keeps ownership legible; the
+// palette option gives that up on purpose, so a patch somebody else dug is coloured by what it
+// turned up exactly like one of yours and the map reads as a single picture.
+function peerFill(p) {
+  if (peerPatchMode === "palette") return patchFill(p);
+  return withAlpha(p.color, peerPatchMode === "solid" ? 1 : 0.28);
+}
 function heatColor(t, alpha, lift) {
   let i = 0;
   while (i < HEAT_RAMP.length - 2 && t > HEAT_RAMP[i + 1][0]) i++;
@@ -570,6 +609,7 @@ function scanAt(x, y) {
                   pending: { x, y, c: penC, key } };   // becomes a real patch at scanDone
   lastScan = { k0, W, cols: penC };
   scanActive = true;
+  if (mp && mp.digging) mp.digging(pendingScan.pending);   // claim the square while it is being drilled
   balGen++; balBatch = { gen: balGen, total: 0, done: 0, funded: 0, failed: 0, scan: true };  // fresh balance session
   scanRevealed = false; verifyDone = false; hideChecking();   // fresh scan: nothing revealed / verified yet
   firstAddr = null;
@@ -887,6 +927,7 @@ worker.onmessage = (e) => {
     commitPatch(msg.checked, msg.foundCount);
     if (msg.display) renderPatchList(msg.display, msg.total, msg.bloomOn);
     scanActive = false;
+    if (mp && mp.digging) mp.digging(null);        // a no-op when commitPatch already announced it
     render(); scheduleSave();
     finishScanUI();
     return;
@@ -1313,6 +1354,7 @@ function showResetToast(msg) {
 }
 function cancelActiveWork() {                     // drop any in-flight scan + queued balance checks
   scanId++; pendingScan = null; scanActive = false; balGen++;
+  if (mp && mp.digging) mp.digging(null);         // take our marker off everyone else's map
   worker.postMessage({ type: "cancel" });
   hideChecking();                                  // tear down the live checking box on cancel/reset
 }
@@ -1904,7 +1946,8 @@ import("./multiplayer.js?v=2")
     },
     // what we have dug this session, and where to put what the others have dug
     myPatches: () => patches,
-    showPeerPatches: (list) => { peerPatches = list; render(); },
+    showPeerPatches: (list, mode) => { peerPatches = list; peerPatchMode = mode || "faded"; render(); },
+    showPeerBusy: (list) => { peerBusy = list; render(); },
   }))
   .then((api) => { mp = api; if (mp) mp.layout(); })
   .catch((e) => console.warn("multiplayer failed to load:", e));
