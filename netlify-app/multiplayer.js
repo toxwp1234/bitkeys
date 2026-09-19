@@ -28,7 +28,12 @@ const SUPABASE_JS = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.116.0/
 const SEND_EVERY = 300;        // ms between movement broadcasts, at most
 const SETTLE = 1500;           // ms of stillness before the presence position is refreshed
 const RETRACK_EVERY = 5000;    // ms between presence updates, at most
-const HIDDEN_GRACE = 30000;    // a background tab lets go of its connection after this long
+// A tab nobody is looking at lets go of its connection after this long. It used to be 30 s,
+// which quietly broke the most ordinary way to test any of this: open a second window, and the
+// first one — still scanning — is occluded, goes hidden, and drops off everyone's map before you
+// have finished typing the coordinates. Three minutes is still a background tab giving its
+// connection back; it is no longer a window that vanishes while you glance away from it.
+const HIDDEN_GRACE = 180000;
 const EASE_MS = 90;            // interpolation time constant on the receiving side
 const NAME_MAX = 20;
 const ME_STORE = "cuvre-player-v1";
@@ -38,7 +43,11 @@ const ALPHA_STORE = "cuvre-peer-alpha-v1";
 // them through your own heat ramp exactly like your own squares, which is the only way the map
 // reads as one picture instead of two. The app owns the ramp, so the choice is passed to it.
 const PEER_MODES = ["faded", "solid", "palette"];
-const BUSY_TTL = 60000;        // forget a peer's "digging here" marker if nothing ends it
+// Backstop for a "digging here" marker that nothing ever ends. It has to outlast a real dig —
+// a pen of 1,200 is 1.44 million keys and runs for many minutes — and it is not the main
+// cleanup anyway: a peer who leaves the tile, or drops off it, takes their marker with them.
+// At a minute it was expiring live drills mid-scan, which looked exactly like never sending one.
+const BUSY_TTL = 900000;
 const MAX_BRUSH = 1000000;     // the app's own brush cap once the slider is unlocked (app.js penCap)
 // A tile is 2^64 keys a side — 1.8e19 of them across the map, so two players share one only
 // when they meant to, and once they do it takes a deliberate journey to leave it again.
@@ -660,9 +669,16 @@ export async function initMultiplayer(game) {
   }
   // A tab in the background still holds one of the free plan's 200 connections. Give it back
   // after a while and rejoin the moment the tab is looked at again.
+  // A window with a scan in flight is not idle, whoever is looking at it. Dropping it there is
+  // the worst possible moment: its square is claimed on everyone else's map, and leaving takes
+  // that claim down — so the one thing the claim exists to prevent is what happens next.
+  function idleOut() {
+    if (myBusy) { hideTimer = setTimeout(idleOut, HIDDEN_GRACE); return; }
+    leave(true);
+  }
   document.addEventListener("visibilitychange", () => {
     clearTimeout(hideTimer);
-    if (document.hidden) hideTimer = setTimeout(() => leave(true), HIDDEN_GRACE);
+    if (document.hidden) hideTimer = setTimeout(idleOut, HIDDEN_GRACE);
     else join();
   });
   window.addEventListener("pagehide", () => leave(false));
