@@ -32,6 +32,11 @@ const HIDDEN_GRACE = 30000;    // a background tab lets go of its connection aft
 const EASE_MS = 90;            // interpolation time constant on the receiving side
 const NAME_MAX = 20;
 const ME_STORE = "cuvre-player-v1";
+const ALPHA_STORE = "cuvre-peer-alpha-v1";
+// How loudly other players' squares are painted. Faded reads as "someone else's, and not in your
+// way"; solid gives the map one consistent weight, so a dug area looks dug whoever dug it. Either
+// way the square carries the owner's colour, and either way it stays under your own territory.
+const PEER_ALPHA = { faded: 0.28, solid: 1 };
 // A tile is 2^64 keys a side — 1.8e19 of them across the map, so two players share one only
 // when they meant to, and once they do it takes a deliberate journey to leave it again.
 // It is deliberately huge: at any but the deepest zoom, one screen pixel is already millions of
@@ -72,6 +77,11 @@ function loadMe() {
   return { name, color };
 }
 function saveMe(me) { try { localStorage.setItem(ME_STORE, JSON.stringify(me)); } catch (e) {} }
+function loadAlphaMode() {
+  let s = null;
+  try { s = localStorage.getItem(ALPHA_STORE); } catch (e) {}
+  return s === "solid" ? "solid" : "faded";
+}
 
 // ---------- transports ----------
 // One interface, two implementations. A transport hands out CHANNELS; each channel is
@@ -162,6 +172,7 @@ export async function initMultiplayer(game) {
   if (!configured && !useLocal) return null;         // production without keys: no UI, no traffic
 
   const me = loadMe();
+  let alphaMode = loadAlphaMode();                   // how solid other players' squares are drawn
   const peers = new Map();                           // id -> peer (everyone online, lobby-wide)
   const layer = document.createElement("div");
   layer.id = "peers";
@@ -174,6 +185,7 @@ export async function initMultiplayer(game) {
   const nameIn = document.getElementById("pmName");
   const meDot = document.getElementById("pmMeDot");
   const statusEl = document.getElementById("pmStatus");
+  const alphaBtn = document.getElementById("pmBlockAlpha");
   const STATUS_TEXT = {
     connecting: ["…", "var(--muted)", "connecting to the lobby…"],
     online: [null, "#4fb98a", "connected"],
@@ -279,7 +291,7 @@ export async function initMultiplayer(game) {
     const peer = peers.get(id);
     const hex = COLORS[peer && peer.color >= 0 ? peer.color : 0];
     const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
-    return "rgba(" + r + "," + g + "," + b + ",0.28)";
+    return "rgba(" + r + "," + g + "," + b + "," + PEER_ALPHA[alphaMode] + ")";
   }
   function parsePatch(a) {
     if (!Array.isArray(a) || a.length < 3) return null;
@@ -313,6 +325,10 @@ export async function initMultiplayer(game) {
     if (!mine || !mine.size) return;
     const fill = fillFor(id);
     for (const p of mine.values()) p.fill = fill;
+    pushPatches();
+  }
+  function repaintAll() {
+    for (const [id, mine] of peerPatches) { const fill = fillFor(id); for (const p of mine.values()) p.fill = fill; }
     pushPatches();
   }
   function pushPatches() {
@@ -646,6 +662,21 @@ export async function initMultiplayer(game) {
     meDot.style.background = COLORS[me.color];
     meDot.title = "your colour — click to change";
   }
+  function syncAlpha() {
+    if (!alphaBtn) return;
+    const solid = alphaMode === "solid";
+    alphaBtn.textContent = solid ? "solid" : "faded";
+    alphaBtn.classList.toggle("on", solid);
+    alphaBtn.title = solid
+      ? "other players' squares are painted as solidly as your own — click for faded"
+      : "other players' squares are painted faded, so your own territory reads first — click for solid";
+  }
+  if (alphaBtn) alphaBtn.addEventListener("click", () => {
+    alphaMode = alphaMode === "solid" ? "faded" : "solid";
+    try { localStorage.setItem(ALPHA_STORE, alphaMode); } catch (e) {}
+    syncAlpha();
+    repaintAll();
+  });
   wrap.addEventListener("click", (e) => { e.stopPropagation(); openMenu(menu.hidden); });
   document.addEventListener("click", (e) => { if (!menu.hidden && !menu.contains(e.target)) openMenu(false); });
   window.addEventListener("keydown", (e) => { if (e.key === "Escape" && !menu.hidden) openMenu(false); });
@@ -671,6 +702,7 @@ export async function initMultiplayer(game) {
     trackNow();
   });
   syncMe();
+  syncAlpha();
   renderStatus();
 
   return { layout, pointerMoved, dug };

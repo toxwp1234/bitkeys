@@ -1226,23 +1226,6 @@ function travelTo(cx, cy, mark) {
   } });
 }
 
-// While the keyspace is still WIDER than the stage there is nothing to see outside it, so a
-// zoom step must not open a void gap on one side — otherwise the map hangs off an edge for
-// the whole way out and then snaps back the moment it finally fits. Panning into the void is
-// untouched; that is a deliberate move with its own elastic return.
-function clampZoomView() {
-  const w = stage.clientWidth, h = stage.clientHeight;
-  const { kx1, ky1, kx2, ky2 } = keyRect();
-  if (kx2 - kx1 > w) {
-    if (kx1 > 0) subX += kx1;
-    else if (kx2 < w) subX -= w - kx2;
-  }
-  if (ky2 - ky1 > h) {
-    if (ky1 > 0) subY += ky1;
-    else if (ky2 < h) subY -= h - ky2;
-  }
-}
-
 // Re-scale around (mx,my), keeping the key under that point pinned to the same pixel.
 function applyZoom(mx, my) {
   stopGlide();
@@ -1258,9 +1241,13 @@ function applyZoom(mx, my) {
   viewX = kx; subX = rx * cellPx - ax;
   viewY = ky; subY = ry * cellPx - ay;
   normalize();
-  clampZoomView();       // no void gap while the map is still bigger than the stage
-  centerKeyspace();      // self-gates on "does this axis fit?" — centre it the moment it does,
-  render();              // instead of waiting for the whole-space flag and jumping one notch later
+  // Zooming near an edge used to force the map flush against that edge on the same frame, and
+  // to jump dead-centre the instant the whole keyspace fitted. Both are correct resting places
+  // and both were reached in one step, which is what made a zoom by the border snap around
+  // under the cursor. They are the SAME resting places the elastic return already knows, so
+  // hand it the job: the key under the pointer stays pinned, and the map eases home behind it.
+  elasticReturn();
+  render();
   updateZoomDisplay();
 }
 // From whole space a single 1.15x notch is invisible — you'd need ~240 of them to see a
